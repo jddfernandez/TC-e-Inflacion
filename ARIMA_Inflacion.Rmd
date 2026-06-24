@@ -1,0 +1,1078 @@
+---
+title: "Modelización ARIMA para la Proyección de Inflación en Bolivia"
+subtitle: "Metodología de Box-Jenkins"
+author: "Análisis Econométrico"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center",
+  comment    = "#>"
+)
+
+required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra")
+new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
+if (length(new_pkg)) install.packages(new_pkg, repos = "https://cloud.r-project.org")
+
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(urca)
+library(lmtest)
+library(kableExtra)
+library(scales)
+
+tema <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+theme_set(tema)
+```
+
+# Introducción
+
+El presente documento aplica la **metodología de Box-Jenkins** para la identificación, estimación y diagnóstico de modelos ARIMA orientados a la proyección de la **inflación mensual** en Bolivia, medida a través de la variación porcentual mensual del Índice de Precios al Consumidor (IPC) con base 2017.
+
+La metodología de Box-Jenkins comprende cuatro etapas:
+
+1. **Análisis preliminar**: inspección visual de la serie y verificación de estacionariedad.
+2. **Identificación**: determinación del orden $(p, d, q)$ mediante las funciones de autocorrelación (ACF), autocorrelación parcial (PACF) y pruebas de raíz unitaria.
+3. **Estimación**: ajuste de los modelos candidatos por máxima verosimilitud.
+4. **Diagnóstico**: verificación de que los residuos del modelo sean ruido blanco, que las raíces inversas se ubiquen dentro del círculo unitario, y selección del modelo ganador.
+
+---
+
+# Carga y Transformación de Datos
+
+## Lectura del IPC
+
+```{r carga-ipc}
+meses_map <- c("Enero"=1,"Febrero"=2,"Marzo"=3,"Abril"=4,"Mayo"=5,
+               "Junio"=6,"Julio"=7,"Agosto"=8,"Septiembre"=9,
+               "Octubre"=10,"Noviembre"=11,"Diciembre"=12)
+
+ipc_raw <- read_excel("Inputs/BD Bruta.xlsx", sheet = "IPC")
+
+ipc <- ipc_raw %>%
+  mutate(Valor_num = suppressWarnings(as.numeric(Valor))) %>%
+  filter(!is.na(Valor_num)) %>%
+  mutate(
+    mes_num = meses_map[Mes],
+    fecha   = as.Date(paste(Año, mes_num, "01", sep = "-")),
+    IPC     = Valor_num
+  ) %>%
+  arrange(fecha) %>%
+  select(fecha, Año, Mes, mes_num, IPC)
+
+cat("Período disponible:", format(min(ipc$fecha), "%B %Y"), "—",
+    format(max(ipc$fecha), "%B %Y"), "\n")
+cat("Observaciones:", nrow(ipc), "\n")
+```
+
+## Construcción de Variables de Inflación
+
+Se construyen dos medidas de inflación a partir del IPC:
+
+- **Variación mensual** $\pi_t^m = \left(\frac{IPC_t}{IPC_{t-1}} - 1\right) \times 100$
+- **Variación interanual** $\pi_t^a = \left(\frac{IPC_t}{IPC_{t-12}} - 1\right) \times 100$
+
+```{r inflacion}
+ipc <- ipc %>%
+  mutate(
+    inf_mensual    = (IPC / lag(IPC)     - 1) * 100,
+    inf_interanual = (IPC / lag(IPC, 12) - 1) * 100
+  )
+```
+
+## Lectura y Mensualización del Tipo de Cambio
+
+```{r carga-tc}
+tc_raw <- read_excel("Inputs/BD Bruta.xlsx", sheet = "TC")
+names(tc_raw) <- trimws(names(tc_raw))
+
+tc_mensual <- tc_raw %>%
+  mutate(
+    fecha_date = as.Date(fecha),
+    año_tc     = year(fecha_date),
+    mes_tc     = month(fecha_date)
+  ) %>%
+  group_by(año_tc, mes_tc) %>%
+  summarise(
+    TC_preferencial = mean(`TC PREFERENCIAL`, na.rm = TRUE),
+    TC_digital      = mean(`TC-DIGITAL`,      na.rm = TRUE),
+    TC_oficial      = first(`TC-OFICIAL`),
+    TC_referencial  = mean(`TC-REFERENCIAL`,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(fecha = as.Date(paste(año_tc, mes_tc, "01", sep = "-")))
+```
+
+## Base de Datos Mensual Consolidada (desde 2022)
+
+```{r bd-mensual}
+bd_mensual <- ipc %>%
+  filter(year(fecha) >= 2022) %>%
+  left_join(tc_mensual %>% select(fecha, starts_with("TC_")),
+            by = "fecha")
+
+kable(bd_mensual, digits = 4, caption = "Base de datos mensual consolidada") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11) %>%
+  scroll_box(height = "400px")
+```
+
+---
+
+# Análisis Preliminar
+
+## Definición de la Serie de Análisis
+
+La variable a modelar es la **variación porcentual mensual del IPC** ($\pi_t^m$), dado que el IPC en nivel contiene una tendencia estocástica que lo hace no estacionario. La transformación a tasas de variación es el procedimiento estándar en la literatura de modelación de inflación.
+
+```{r serie-analisis}
+ipc_analisis <- ipc %>%
+  filter(year(fecha) >= 2022, !is.na(inf_mensual))
+
+inf_ts <- ts(ipc_analisis$inf_mensual,
+             start = c(year(min(ipc_analisis$fecha)),
+                        month(min(ipc_analisis$fecha))),
+             frequency = 12)
+
+cat("Serie de análisis: inflación mensual\n")
+cat("Período:", format(min(ipc_analisis$fecha), "%B %Y"), "—",
+    format(max(ipc_analisis$fecha), "%B %Y"), "\n")
+cat("Observaciones:", length(inf_ts), "\n")
+```
+
+## Evolución del IPC (nivel)
+
+```{r plot-ipc}
+ipc %>%
+  filter(year(fecha) >= 2022) %>%
+  ggplot(aes(x = fecha, y = IPC)) +
+  geom_line(color = "#2c3e50", linewidth = 0.8) +
+  geom_point(color = "#2c3e50", size = 1.2) +
+  labs(title = "Índice de Precios al Consumidor — Bolivia",
+       subtitle = "Base 2017 = 100",
+       x = NULL, y = "IPC") +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+El IPC muestra una **tendencia creciente sostenida**, confirmando la no estacionariedad en nivel.
+
+## Inflación Mensual (variable a modelar)
+
+```{r plot-inf-mensual}
+ipc_analisis %>%
+  ggplot(aes(x = fecha, y = inf_mensual)) +
+  geom_line(color = "#2980b9", linewidth = 0.7) +
+  geom_point(color = "#2980b9", size = 1.2) +
+  geom_hline(yintercept = mean(ipc_analisis$inf_mensual),
+             linetype = "dashed", color = "#e74c3c") +
+  annotate("text", x = min(ipc_analisis$fecha) + 60,
+           y = mean(ipc_analisis$inf_mensual) + 0.1,
+           label = paste0("Media = ", round(mean(ipc_analisis$inf_mensual), 3), "%"),
+           color = "#e74c3c", size = 3.5) +
+  labs(title = "Inflación Mensual — Bolivia",
+       subtitle = "Variación porcentual mensual del IPC",
+       x = NULL, y = "Variación mensual (%)") +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Inflación Interanual
+
+```{r plot-inf-interanual}
+ipc %>%
+  filter(year(fecha) >= 2022, !is.na(inf_interanual)) %>%
+  ggplot(aes(x = fecha, y = inf_interanual)) +
+  geom_line(color = "#27ae60", linewidth = 0.7) +
+  geom_point(color = "#27ae60", size = 1.2) +
+  labs(title = "Inflación Interanual — Bolivia",
+       subtitle = "Variación porcentual a 12 meses del IPC",
+       x = NULL, y = "Inflación interanual (%)") +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Estadísticas Descriptivas
+
+```{r descriptivas}
+n_obs     <- length(inf_ts)
+x_cent    <- as.numeric(inf_ts) - mean(inf_ts)
+asimetria <- round(sum(x_cent^3) / n_obs / (sd(inf_ts)^3), 4)
+curtosis  <- round(sum(x_cent^4) / n_obs / (sd(inf_ts)^4), 4)
+
+stats <- data.frame(
+  Estadistico = c("Media", "Mediana", "Desv. Estandar", "Minimo", "Maximo",
+                   "Asimetria", "Curtosis", "Observaciones"),
+  Valor = c(
+    round(mean(inf_ts), 4),
+    round(median(inf_ts), 4),
+    round(sd(inf_ts), 4),
+    round(min(inf_ts), 4),
+    round(max(inf_ts), 4),
+    asimetria,
+    curtosis,
+    n_obs
+  )
+)
+
+kable(stats, col.names = c("Estadístico", "Valor"),
+      caption = "Estadísticas descriptivas — Inflación mensual (%)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+```{r histograma}
+data.frame(inf = as.numeric(inf_ts)) %>%
+  ggplot(aes(x = inf)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 15,
+                 fill = "#3498db", alpha = 0.6, color = "white") +
+  geom_density(color = "#e74c3c", linewidth = 1) +
+  geom_vline(xintercept = mean(inf_ts), linetype = "dashed", color = "#2c3e50") +
+  labs(title = "Distribución de la Inflación Mensual",
+       x = "Variación mensual (%)", y = "Densidad")
+```
+
+---
+
+# Verificación de Estacionariedad (Raíz Unitaria)
+
+La estacionariedad es un requisito fundamental para la aplicación de modelos ARIMA. Se aplican tres pruebas complementarias:
+
+| Prueba | Hipótesis nula | Criterio |
+|--------|----------------|----------|
+| ADF    | Existe raíz unitaria (no estacionaria) | Rechazar $H_0$ para confirmar estacionariedad |
+| Phillips-Perron | Existe raíz unitaria | Rechazar $H_0$ para confirmar estacionariedad |
+| KPSS   | La serie es estacionaria | No rechazar $H_0$ para confirmar estacionariedad |
+
+## Prueba de Dickey-Fuller Aumentado (ADF)
+
+```{r adf-nivel}
+cat("========================================\n")
+cat("ADF sobre IPC en nivel\n")
+cat("========================================\n")
+ipc_nivel_ts <- ts(ipc$IPC[ipc$Año >= 2022], start = c(2022,1), frequency = 12)
+adf_nivel <- adf.test(ipc_nivel_ts)
+cat("Estadístico:", round(adf_nivel$statistic, 4), "\n")
+cat("p-valor:", round(adf_nivel$p.value, 4), "\n")
+cat("Conclusión:", ifelse(adf_nivel$p.value < 0.05,
+    "Se rechaza H0 → Serie estacionaria",
+    "No se rechaza H0 → Serie NO estacionaria"), "\n\n")
+
+cat("========================================\n")
+cat("ADF sobre inflación mensual\n")
+cat("========================================\n")
+adf_inf <- adf.test(inf_ts)
+cat("Estadístico:", round(adf_inf$statistic, 4), "\n")
+cat("p-valor:", round(adf_inf$p.value, 4), "\n")
+cat("Conclusión:", ifelse(adf_inf$p.value < 0.05,
+    "Se rechaza H0 → Serie estacionaria",
+    "No se rechaza H0 → Serie NO estacionaria"), "\n")
+```
+
+## Prueba de Phillips-Perron (PP)
+
+```{r pp-test}
+cat("========================================\n")
+cat("PP sobre IPC en nivel\n")
+cat("========================================\n")
+pp_nivel <- pp.test(ipc_nivel_ts)
+cat("Estadístico:", round(pp_nivel$statistic, 4), "\n")
+cat("p-valor:", round(pp_nivel$p.value, 4), "\n")
+cat("Conclusión:", ifelse(pp_nivel$p.value < 0.05,
+    "Se rechaza H0 → Serie estacionaria",
+    "No se rechaza H0 → Serie NO estacionaria"), "\n\n")
+
+cat("========================================\n")
+cat("PP sobre inflación mensual\n")
+cat("========================================\n")
+pp_inf <- pp.test(inf_ts)
+cat("Estadístico:", round(pp_inf$statistic, 4), "\n")
+cat("p-valor:", round(pp_inf$p.value, 4), "\n")
+cat("Conclusión:", ifelse(pp_inf$p.value < 0.05,
+    "Se rechaza H0 → Serie estacionaria",
+    "No se rechaza H0 → Serie NO estacionaria"), "\n")
+```
+
+## Prueba KPSS
+
+```{r kpss-test}
+cat("========================================\n")
+cat("KPSS sobre IPC en nivel\n")
+cat("========================================\n")
+kpss_nivel <- kpss.test(ipc_nivel_ts, null = "Level")
+cat("Estadístico:", round(kpss_nivel$statistic, 4), "\n")
+cat("p-valor:", round(kpss_nivel$p.value, 4), "\n")
+cat("Conclusión:", ifelse(kpss_nivel$p.value < 0.05,
+    "Se rechaza H0 → Serie NO estacionaria",
+    "No se rechaza H0 → Serie estacionaria"), "\n\n")
+
+cat("========================================\n")
+cat("KPSS sobre inflación mensual\n")
+cat("========================================\n")
+kpss_inf <- kpss.test(inf_ts, null = "Level")
+cat("Estadístico:", round(kpss_inf$statistic, 4), "\n")
+cat("p-valor:", round(kpss_inf$p.value, 4), "\n")
+cat("Conclusión:", ifelse(kpss_inf$p.value < 0.05,
+    "Se rechaza H0 → Serie NO estacionaria",
+    "No se rechaza H0 → Serie estacionaria"), "\n")
+```
+
+## Prueba ADF ampliada (paquete urca)
+
+Se utiliza el paquete `urca` para una prueba ADF con selección automática de rezagos, incluyendo constante y tendencia:
+
+```{r urca-adf}
+ur_nivel <- ur.df(ipc_nivel_ts, type = "trend", selectlags = "AIC")
+cat("ADF (urca) — IPC en nivel:\n")
+summary(ur_nivel)
+
+ur_inf <- ur.df(inf_ts, type = "drift", selectlags = "AIC")
+cat("\nADF (urca) — Inflación mensual:\n")
+summary(ur_inf)
+```
+
+## Resumen de Pruebas y Determinación de $d$
+
+```{r resumen-raiz}
+resumen_ur <- data.frame(
+  Serie = rep(c("IPC (nivel)", "Inflación mensual"), each = 3),
+  Prueba = rep(c("ADF", "PP", "KPSS"), 2),
+  Estadístico = c(
+    round(adf_nivel$statistic, 4), round(pp_nivel$statistic, 4),
+    round(kpss_nivel$statistic, 4),
+    round(adf_inf$statistic, 4), round(pp_inf$statistic, 4),
+    round(kpss_inf$statistic, 4)
+  ),
+  `p-valor` = c(
+    round(adf_nivel$p.value, 4), round(pp_nivel$p.value, 4),
+    round(kpss_nivel$p.value, 4),
+    round(adf_inf$p.value, 4), round(pp_inf$p.value, 4),
+    round(kpss_inf$p.value, 4)
+  ),
+  Conclusión = c(
+    ifelse(adf_nivel$p.value < 0.05, "Estacionaria", "No estacionaria"),
+    ifelse(pp_nivel$p.value  < 0.05, "Estacionaria", "No estacionaria"),
+    ifelse(kpss_nivel$p.value < 0.05, "No estacionaria", "Estacionaria"),
+    ifelse(adf_inf$p.value < 0.05, "Estacionaria", "No estacionaria"),
+    ifelse(pp_inf$p.value  < 0.05, "Estacionaria", "No estacionaria"),
+    ifelse(kpss_inf$p.value < 0.05, "No estacionaria", "Estacionaria")
+  )
+)
+
+kable(resumen_ur, caption = "Resumen de pruebas de raíz unitaria") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("IPC en nivel", 1, 3) %>%
+  pack_rows("Inflación mensual", 4, 6)
+```
+
+```{r determinar-d}
+d_recomendado <- ndiffs(inf_ts, test = "adf")
+cat("Orden de diferenciación recomendado (ndiffs con ADF):", d_recomendado, "\n")
+
+D_recomendado <- nsdiffs(inf_ts, test = "ocsb")
+cat("Diferenciación estacional recomendada (nsdiffs):", D_recomendado, "\n")
+```
+
+```{r diferenciacion, eval=(ndiffs(inf_ts, test="adf") > 0)}
+cat("La serie requiere diferenciación. Se procede a diferenciar:\n")
+inf_diff <- diff(inf_ts, differences = d_recomendado)
+
+par(mfrow = c(1,2))
+plot(inf_ts, main = "Serie original", ylab = "Inflación mensual (%)")
+plot(inf_diff, main = paste0("Serie diferenciada (d=", d_recomendado, ")"),
+     ylab = "Inflación diferenciada")
+par(mfrow = c(1,1))
+
+adf_diff <- adf.test(inf_diff)
+cat("ADF sobre serie diferenciada — p-valor:", round(adf_diff$p.value, 4), "\n")
+```
+
+---
+
+# Identificación del Modelo $(p, d, q)$
+
+## Función de Autocorrelación (ACF)
+
+La ACF permite identificar el orden del componente MA($q$): un decaimiento abrupto (truncamiento) en el rezago $q$ sugiere un MA($q$).
+
+```{r acf}
+acf_vals <- Acf(inf_ts, lag.max = 24, plot = FALSE)
+
+autoplot(acf_vals) +
+  labs(title = "Función de Autocorrelación (ACF) — Inflación Mensual") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Función de Autocorrelación Parcial (PACF)
+
+La PACF permite identificar el orden del componente AR($p$): un truncamiento en el rezago $p$ sugiere un AR($p$).
+
+```{r pacf}
+pacf_vals <- Pacf(inf_ts, lag.max = 24, plot = FALSE)
+
+autoplot(pacf_vals) +
+  labs(title = "Función de Autocorrelación Parcial (PACF) — Inflación Mensual") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Criterios de Identificación
+
+```{r criterios-identificacion}
+acf_sig  <- which(abs(acf_vals$acf[-1]) > qnorm(0.975) / sqrt(length(inf_ts)))
+pacf_sig <- which(abs(pacf_vals$acf)     > qnorm(0.975) / sqrt(length(inf_ts)))
+
+cat("Rezagos significativos en ACF:",
+    if(length(acf_sig) > 0) paste(acf_sig, collapse = ", ") else "Ninguno", "\n")
+cat("Rezagos significativos en PACF:",
+    if(length(pacf_sig) > 0) paste(pacf_sig, collapse = ", ") else "Ninguno", "\n\n")
+
+cat("Guía de identificación:\n")
+cat("——————————————————————————————————————————\n")
+cat("| Patrón       | ACF              | PACF             |\n")
+cat("| AR(p)        | Decae gradual    | Trunca en p      |\n")
+cat("| MA(q)        | Trunca en q      | Decae gradual    |\n")
+cat("| ARMA(p,q)    | Decae gradual    | Decae gradual    |\n")
+cat("——————————————————————————————————————————\n")
+```
+
+## Modelos Candidatos
+
+Con base en el análisis de ACF, PACF y las pruebas de raíz unitaria, se propone un conjunto de modelos candidatos ARIMA$(p, d, q)$ para evaluación sistemática:
+
+```{r modelos-candidatos}
+d_val <- ndiffs(inf_ts, test = "adf")
+
+ordenes <- list(
+  c(1,0,0), c(2,0,0), c(3,0,0), c(4,0,0),
+  c(0,0,1), c(0,0,2), c(0,0,3),
+  c(1,0,1), c(2,0,1), c(1,0,2), c(2,0,2),
+  c(3,0,1), c(1,0,3)
+)
+
+if (d_val >= 1) {
+  ordenes <- c(ordenes, list(
+    c(0,1,1), c(1,1,0), c(1,1,1), c(2,1,0),
+    c(2,1,1), c(0,1,2), c(1,1,2)
+  ))
+}
+
+cat("Total de modelos candidatos:", length(ordenes), "\n")
+cat("Modelos propuestos:\n")
+for (i in seq_along(ordenes)) {
+  o <- ordenes[[i]]
+  cat(sprintf("  %2d. ARIMA(%d,%d,%d)\n", i, o[1], o[2], o[3]))
+}
+```
+
+---
+
+# Estimación de Modelos
+
+## Estimación por Máxima Verosimilitud
+
+Se estima cada modelo candidato mediante **máxima verosimilitud** (ML). Los modelos que no convergen se descartan automáticamente.
+
+```{r estimacion}
+ajustar_arima <- function(serie, orden) {
+  tryCatch({
+    modelo <- Arima(serie, order = orden, method = "ML")
+    list(
+      modelo    = modelo,
+      orden     = orden,
+      aic       = AIC(modelo),
+      bic       = BIC(modelo),
+      aicc      = modelo$aicc,
+      loglik    = as.numeric(logLik(modelo)),
+      npar      = length(coef(modelo)) + 1,
+      converged = TRUE
+    )
+  }, error = function(e) {
+    list(
+      modelo    = NULL,
+      orden     = orden,
+      aic       = NA, bic = NA, aicc = NA,
+      loglik    = NA, npar = NA,
+      converged = FALSE
+    )
+  })
+}
+
+resultados <- lapply(ordenes, function(o) ajustar_arima(inf_ts, o))
+
+tabla_modelos <- do.call(rbind, lapply(resultados, function(r) {
+  data.frame(
+    Modelo    = sprintf("ARIMA(%d,%d,%d)", r$orden[1], r$orden[2], r$orden[3]),
+    p = r$orden[1], d = r$orden[2], q = r$orden[3],
+    AIC       = r$aic,
+    BIC       = r$bic,
+    AICc      = r$aicc,
+    LogLik    = r$loglik,
+    Parámetros = r$npar,
+    Convergió = r$converged
+  )
+}))
+
+tabla_convergidos <- tabla_modelos %>%
+  filter(Convergió == TRUE) %>%
+  arrange(AIC)
+```
+
+## Tabla Comparativa de Criterios de Información
+
+```{r tabla-comparativa}
+tabla_display <- tabla_convergidos %>%
+  select(Modelo, AIC, BIC, AICc, LogLik, Parámetros) %>%
+  mutate(across(c(AIC, BIC, AICc, LogLik), ~round(., 2)))
+
+kable(tabla_display,
+      caption = "Comparación de modelos ARIMA — Criterios de información",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#27ae60")
+```
+
+El modelo con menor AIC se resalta en verde.
+
+## Selección Automática (auto.arima)
+
+Como benchmark, se utiliza `auto.arima()` que implementa un algoritmo de búsqueda paso a paso con penalización por criterios de información:
+
+```{r auto-arima}
+auto_fit <- auto.arima(inf_ts, seasonal = TRUE, stepwise = FALSE,
+                       approximation = FALSE, trace = FALSE)
+cat("Modelo seleccionado por auto.arima:\n")
+summary(auto_fit)
+```
+
+```{r agregar-auto}
+auto_orden <- arimaorder(auto_fit)
+cat(sprintf("\nauto.arima seleccionó: ARIMA(%d,%d,%d)\n",
+            auto_orden[1], auto_orden[2], auto_orden[3]))
+cat("AIC:", round(AIC(auto_fit), 2), "\n")
+cat("BIC:", round(BIC(auto_fit), 2), "\n")
+```
+
+---
+
+# Diagnóstico del Modelo Ganador
+
+## Selección del Modelo Ganador
+
+Se selecciona el modelo con menor AIC entre los que convergen. Posteriormente se verifica que cumpla los criterios de diagnóstico.
+
+```{r seleccion-ganador}
+idx_ganador <- which.min(sapply(resultados, function(r) {
+  if(r$converged) r$aic else Inf
+}))
+ganador <- resultados[[idx_ganador]]
+modelo_ganador <- ganador$modelo
+
+cat(sprintf("Modelo ganador: ARIMA(%d,%d,%d)\n",
+            ganador$orden[1], ganador$orden[2], ganador$orden[3]))
+cat("AIC:", round(ganador$aic, 2), "\n")
+cat("BIC:", round(ganador$bic, 2), "\n")
+cat("Log-verosimilitud:", round(ganador$loglik, 2), "\n")
+```
+
+## Significancia de los Coeficientes
+
+```{r coeficientes}
+coefs   <- coef(modelo_ganador)
+se_vals <- sqrt(diag(vcov(modelo_ganador)))
+z_vals  <- coefs / se_vals
+p_vals  <- 2 * (1 - pnorm(abs(z_vals)))
+
+tabla_coefs <- data.frame(
+  Coeficiente  = names(coefs),
+  Estimación   = round(coefs, 6),
+  `Error Std.` = round(se_vals, 6),
+  `Estadístico z` = round(z_vals, 4),
+  `p-valor`    = round(p_vals, 4),
+  Significativo = ifelse(p_vals < 0.01, "***",
+                  ifelse(p_vals < 0.05, "**",
+                  ifelse(p_vals < 0.10, "*", "")))
+)
+
+kable(tabla_coefs, caption = "Coeficientes del modelo ganador",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+cat("\nNiveles de significancia: *** p<0.01, ** p<0.05, * p<0.10\n")
+```
+
+## Análisis de Residuos
+
+```{r residuos-plot}
+residuos <- residuals(modelo_ganador)
+
+par(mfrow = c(2,2))
+
+plot(residuos, main = "Residuos del modelo", ylab = "Residuos", col = "#2c3e50")
+abline(h = 0, col = "red", lty = 2)
+
+hist(residuos, breaks = 15, probability = TRUE, main = "Histograma de residuos",
+     col = "#3498db80", border = "white", xlab = "Residuos")
+curve(dnorm(x, mean = mean(residuos), sd = sd(residuos)),
+      add = TRUE, col = "#e74c3c", lwd = 2)
+
+Acf(residuos, main = "ACF de Residuos", lag.max = 20)
+Pacf(residuos, main = "PACF de Residuos", lag.max = 20)
+
+par(mfrow = c(1,1))
+```
+
+```{r qq-plot}
+qqnorm(residuos, main = "Q-Q Plot de Residuos", col = "#2c3e50", pch = 16)
+qqline(residuos, col = "#e74c3c", lwd = 2)
+```
+
+## Prueba de Ljung-Box (ruido blanco en residuos)
+
+La prueba de Ljung-Box evalúa si los residuos son ruido blanco (autocorrelaciones conjuntamente iguales a cero).
+
+$H_0$: Los residuos son ruido blanco (no hay autocorrelación)
+$H_1$: Existe autocorrelación en los residuos
+
+```{r ljung-box}
+rezagos_lb <- c(6, 12, 18, 24)
+lb_resultados <- lapply(rezagos_lb, function(h) {
+  n_params <- length(coef(modelo_ganador))
+  df_val <- max(h - n_params, 1)
+  test <- Box.test(residuos, lag = h, type = "Ljung-Box", fitdf = n_params)
+  data.frame(
+    Rezagos     = h,
+    Estadístico = round(test$statistic, 4),
+    `g.l.`      = df_val,
+    `p-valor`   = round(test$p.value, 4),
+    Conclusión  = ifelse(test$p.value > 0.05,
+                         "No se rechaza H0 (ruido blanco)",
+                         "Se rechaza H0 (autocorrelación)")
+  )
+})
+
+tabla_lb <- do.call(rbind, lb_resultados)
+
+kable(tabla_lb, caption = "Prueba de Ljung-Box sobre residuos",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Prueba de Normalidad (Jarque-Bera)
+
+$H_0$: Los residuos siguen una distribución normal
+$H_1$: Los residuos no siguen una distribución normal
+
+```{r jarque-bera}
+jb <- jarque.bera.test(residuos)
+cat("Prueba de Jarque-Bera:\n")
+cat("Estadístico:", round(jb$statistic, 4), "\n")
+cat("p-valor:", round(jb$p.value, 4), "\n")
+cat("Conclusión:", ifelse(jb$p.value > 0.05,
+    "No se rechaza H0 → Residuos normales",
+    "Se rechaza H0 → Residuos no normales"), "\n")
+
+sw <- shapiro.test(residuos)
+cat("\nPrueba de Shapiro-Wilk:\n")
+cat("Estadístico:", round(sw$statistic, 4), "\n")
+cat("p-valor:", round(sw$p.value, 4), "\n")
+cat("Conclusión:", ifelse(sw$p.value > 0.05,
+    "No se rechaza H0 → Residuos normales",
+    "Se rechaza H0 → Residuos no normales"), "\n")
+```
+
+## Raíces Inversas de los Polinomios AR y MA
+
+Para que el modelo sea estacionario e invertible, todas las raíces inversas del polinomio AR (y MA) deben encontrarse **dentro del círculo unitario** (módulo < 1).
+
+```{r raices-inversas}
+par(mfrow = c(1,1))
+
+# Extraer raíces AR y MA
+ar_coefs <- modelo_ganador$model$phi
+ma_coefs <- modelo_ganador$model$theta
+
+tiene_ar <- length(ar_coefs) > 0 && any(ar_coefs != 0)
+tiene_ma <- length(ma_coefs) > 0 && any(ma_coefs != 0)
+
+if (tiene_ar || tiene_ma) {
+  theta_circle <- seq(0, 2*pi, length.out = 200)
+
+  n_plots <- tiene_ar + tiene_ma
+  if (n_plots == 2) par(mfrow = c(1,2))
+
+  if (tiene_ar) {
+    ar_roots <- polyroot(c(1, -ar_coefs))
+    ar_inv   <- 1 / ar_roots
+
+    plot(Re(ar_inv), Im(ar_inv), xlim = c(-1.5, 1.5), ylim = c(-1.5, 1.5),
+         pch = 19, col = "#e74c3c", cex = 2, asp = 1,
+         main = "Raíces Inversas AR", xlab = "Real", ylab = "Imaginario")
+    lines(cos(theta_circle), sin(theta_circle), col = "grey50", lwd = 2)
+    abline(h = 0, v = 0, lty = 3, col = "grey70")
+
+    cat("Raíces inversas AR (módulo):\n")
+    print(round(Mod(ar_inv), 4))
+    cat("Todas dentro del círculo unitario:",
+        all(Mod(ar_inv) < 1), "\n\n")
+  }
+
+  if (tiene_ma) {
+    ma_roots <- polyroot(c(1, ma_coefs))
+    ma_inv   <- 1 / ma_roots
+
+    plot(Re(ma_inv), Im(ma_inv), xlim = c(-1.5, 1.5), ylim = c(-1.5, 1.5),
+         pch = 19, col = "#2980b9", cex = 2, asp = 1,
+         main = "Raíces Inversas MA", xlab = "Real", ylab = "Imaginario")
+    lines(cos(theta_circle), sin(theta_circle), col = "grey50", lwd = 2)
+    abline(h = 0, v = 0, lty = 3, col = "grey70")
+
+    cat("Raíces inversas MA (módulo):\n")
+    print(round(Mod(ma_inv), 4))
+    cat("Todas dentro del círculo unitario:",
+        all(Mod(ma_inv) < 1), "\n")
+  }
+
+  par(mfrow = c(1,1))
+} else {
+  cat("El modelo no tiene componentes AR ni MA con coeficientes distintos de cero.\n")
+}
+```
+
+## Resumen del Diagnóstico
+
+```{r resumen-diagnostico}
+lb_pvals_diag <- sapply(rezagos_lb, function(h) {
+  n_params <- length(coef(modelo_ganador))
+  Box.test(residuos, lag = h, type = "Ljung-Box", fitdf = n_params)$p.value
+})
+lb_check <- all(lb_pvals_diag > 0.05)
+
+jb_check <- jb$p.value > 0.05
+
+raices_check <- TRUE
+if (tiene_ar) raices_check <- raices_check && all(Mod(1/polyroot(c(1, -ar_coefs))) < 1)
+if (tiene_ma) raices_check <- raices_check && all(Mod(1/polyroot(c(1,  ma_coefs))) < 1)
+
+res_vals <- c(
+  ifelse(lb_check, "PASA", "NO PASA"),
+  ifelse(jb_check, "PASA", "NO PASA"),
+  ifelse(raices_check, "PASA", "NO PASA")
+)
+
+resumen_diag <- data.frame(
+  Criterio = c("Ljung-Box (ruido blanco)",
+               "Normalidad (Jarque-Bera)",
+               "Raices inversas dentro del circulo unitario"),
+  Resultado = res_vals,
+  Detalle = c(
+    paste("p-val:", paste(round(lb_pvals_diag, 3), collapse = " / ")),
+    paste("p-val:", round(jb$p.value, 4)),
+    ifelse(raices_check, "Todos |raiz| < 1", "Alguna raiz fuera")
+  )
+)
+
+kable(resumen_diag,
+      col.names = c("Criterio", "Resultado", "Detalle"),
+      caption = "Resumen de diagnóstico del modelo ganador",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(2, bold = TRUE,
+              color = ifelse(res_vals == "PASA", "#27ae60", "#e74c3c"))
+```
+
+## Diagnóstico completo con `checkresiduals`
+
+```{r checkresiduals, fig.height=8}
+checkresiduals(modelo_ganador)
+```
+
+---
+
+# Comparación Final de Modelos
+
+Se evalúan todos los modelos que convergieron, verificando cuáles pasan el diagnóstico completo:
+
+```{r comparacion-final}
+evaluar_modelo <- function(resultado) {
+  if (!resultado$converged) return(NULL)
+
+  mod <- resultado$modelo
+  res <- residuals(mod)
+  ord <- resultado$orden
+  n_params <- length(coef(mod))
+
+  lb_pvals <- sapply(c(6, 12, 18), function(h) {
+    tryCatch(
+      Box.test(res, lag = h, type = "Ljung-Box", fitdf = n_params)$p.value,
+      error = function(e) NA
+    )
+  })
+  lb_ok <- all(lb_pvals > 0.05, na.rm = TRUE)
+
+  jb_pval <- tryCatch(jarque.bera.test(res)$p.value, error = function(e) NA)
+
+  ar_c <- mod$model$phi
+  ma_c <- mod$model$theta
+  raices_ok <- TRUE
+  if (length(ar_c) > 0 && any(ar_c != 0)) {
+    raices_ok <- raices_ok && all(Mod(1/polyroot(c(1, -ar_c))) < 1)
+  }
+  if (length(ma_c) > 0 && any(ma_c != 0)) {
+    raices_ok <- raices_ok && all(Mod(1/polyroot(c(1, ma_c))) < 1)
+  }
+
+  data.frame(
+    Modelo      = sprintf("ARIMA(%d,%d,%d)", ord[1], ord[2], ord[3]),
+    AIC         = round(resultado$aic, 2),
+    BIC         = round(resultado$bic, 2),
+    LB_ok       = ifelse(lb_ok, "Si", "No"),
+    JB_pval     = round(jb_pval, 3),
+    Raices_ok   = ifelse(raices_ok, "Si", "No"),
+    Diagnostico = ifelse(lb_ok & raices_ok, "APROBADO", "NO APROBADO"),
+    stringsAsFactors = FALSE
+  )
+}
+
+eval_todos <- do.call(rbind, lapply(resultados, evaluar_modelo))
+eval_todos <- eval_todos[order(eval_todos$AIC), ]
+
+kable(eval_todos,
+      col.names = c("Modelo","AIC","BIC","LB (p>0.05)","JB (p-val)",
+                     "Raíces OK","Diagnóstico"),
+      caption = "Evaluación completa de modelos candidatos",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11) %>%
+  row_spec(which(eval_todos$Diagnostico == "APROBADO"),
+           background = "#d5f5e3") %>%
+  scroll_box(height = "400px")
+```
+
+```{r modelo-definitivo}
+aprobados <- eval_todos %>% filter(Diagnostico == "APROBADO")
+
+if (nrow(aprobados) > 0) {
+  mejor <- aprobados[1, ]
+  cat(sprintf("MODELO GANADOR: %s\n", mejor$Modelo))
+  cat(sprintf("AIC: %s | BIC: %s\n", mejor$AIC, mejor$BIC))
+  cat("El modelo pasa todas las pruebas de diagnóstico.\n")
+} else {
+  cat("Ningún modelo pasó todas las pruebas. Se selecciona el de menor AIC:\n")
+  mejor <- eval_todos[1, ]
+  cat(sprintf("Mejor modelo disponible: %s (AIC: %s)\n", mejor$Modelo, mejor$AIC))
+}
+```
+
+---
+
+# Pronóstico
+
+## Proyección de Inflación Mensual
+
+Se generan pronósticos para los próximos 7 meses (junio a diciembre de 2026) con intervalos de confianza al 80% y 95%.
+
+```{r pronostico}
+h <- 7
+
+pronostico <- forecast(modelo_ganador, h = h, level = c(80, 95))
+
+autoplot(pronostico) +
+  labs(title = sprintf("Pronóstico de Inflación Mensual — %s", mejor$Modelo),
+       subtitle = "Intervalos de confianza al 80% y 95%",
+       x = NULL, y = "Variación mensual (%)") +
+  scale_x_continuous(breaks = seq(2022, 2027, by = 0.5),
+                     labels = function(x) {
+                       yr <- floor(x)
+                       mo <- round((x - yr) * 12) + 1
+                       paste0(month.abb[pmin(mo, 12)], " ", yr)
+                     }) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Tabla de Pronósticos
+
+```{r tabla-pronostico}
+ultimo_mes  <- max(ipc_analisis$fecha)
+meses_pron  <- seq.Date(ultimo_mes + months(1), by = "month", length.out = h)
+
+tabla_pron <- data.frame(
+  Fecha        = format(meses_pron, "%B %Y"),
+  `Inflación mensual (%)` = round(as.numeric(pronostico$mean), 4),
+  `IC 80% Inf` = round(as.numeric(pronostico$lower[,1]), 4),
+  `IC 80% Sup` = round(as.numeric(pronostico$upper[,1]), 4),
+  `IC 95% Inf` = round(as.numeric(pronostico$lower[,2]), 4),
+  `IC 95% Sup` = round(as.numeric(pronostico$upper[,2]), 4)
+)
+
+kable(tabla_pron, caption = "Pronóstico de inflación mensual — Junio a Diciembre 2026",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Derivación del IPC y la Inflación Interanual Proyectada
+
+```{r ipc-proyectado}
+ultimo_ipc <- tail(ipc_analisis$IPC, 1)
+ipc_proy   <- numeric(h)
+ipc_proy[1] <- ultimo_ipc * (1 + pronostico$mean[1] / 100)
+for (i in 2:h) {
+  ipc_proy[i] <- ipc_proy[i-1] * (1 + pronostico$mean[i] / 100)
+}
+
+ipc_12_meses_atras <- ipc %>%
+  filter(fecha %in% (meses_pron %m-% months(12))) %>%
+  pull(IPC)
+
+inf_interanual_proy <- if (length(ipc_12_meses_atras) == h) {
+  (ipc_proy / ipc_12_meses_atras - 1) * 100
+} else {
+  ipc_completo <- c(ipc$IPC[!is.na(ipc$IPC)], ipc_proy)
+  fechas_completo <- c(ipc$fecha[!is.na(ipc$IPC)], meses_pron)
+
+  sapply(seq_along(meses_pron), function(i) {
+    fecha_actual <- meses_pron[i]
+    fecha_12     <- fecha_actual %m-% months(12)
+    idx_12 <- which.min(abs(fechas_completo - fecha_12))
+    (ipc_proy[i] / ipc_completo[idx_12] - 1) * 100
+  })
+}
+
+tabla_ipc_proy <- data.frame(
+  Fecha = format(meses_pron, "%B %Y"),
+  `IPC proyectado` = round(ipc_proy, 4),
+  `Inflación mensual (%)` = round(as.numeric(pronostico$mean), 4),
+  `Inflación interanual (%)` = round(inf_interanual_proy, 4)
+)
+
+kable(tabla_ipc_proy,
+      caption = "IPC e inflación proyectados — Junio a Diciembre 2026",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Visualización de la Proyección Completa
+
+```{r plot-proyeccion-completa, fig.height=8}
+ipc_historico <- ipc %>%
+  filter(year(fecha) >= 2022, !is.na(IPC)) %>%
+  select(fecha, IPC) %>%
+  mutate(tipo = "Observado")
+
+ipc_futuro <- data.frame(
+  fecha = meses_pron,
+  IPC   = ipc_proy,
+  tipo  = "Proyectado"
+)
+
+ipc_plot <- bind_rows(ipc_historico, ipc_futuro)
+
+p1 <- ggplot(ipc_plot, aes(x = fecha, y = IPC, color = tipo, linetype = tipo)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("Observado" = "#2c3e50", "Proyectado" = "#e74c3c")) +
+  scale_linetype_manual(values = c("Observado" = "solid", "Proyectado" = "dashed")) +
+  labs(title = "IPC Observado y Proyectado",
+       subtitle = "Base 2017 = 100",
+       x = NULL, y = "IPC", color = NULL, linetype = NULL) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+inf_hist <- ipc_analisis %>%
+  select(fecha, inf_mensual) %>%
+  mutate(tipo = "Observado")
+
+inf_fut <- data.frame(
+  fecha       = meses_pron,
+  inf_mensual = as.numeric(pronostico$mean),
+  tipo        = "Proyectado"
+)
+
+inf_plot <- bind_rows(inf_hist, inf_fut)
+
+p2 <- ggplot(inf_plot, aes(x = fecha, y = inf_mensual, color = tipo)) +
+  geom_line(aes(linetype = tipo), linewidth = 0.7) +
+  geom_point(size = 1.2) +
+  geom_ribbon(
+    data = data.frame(
+      fecha = meses_pron,
+      lo95  = as.numeric(pronostico$lower[,2]),
+      hi95  = as.numeric(pronostico$upper[,2])
+    ),
+    aes(x = fecha, ymin = lo95, ymax = hi95),
+    inherit.aes = FALSE, fill = "#e74c3c", alpha = 0.15
+  ) +
+  scale_color_manual(values = c("Observado" = "#2980b9", "Proyectado" = "#e74c3c")) +
+  scale_linetype_manual(values = c("Observado" = "solid", "Proyectado" = "dashed")) +
+  labs(title = "Inflación Mensual — Observada y Proyectada",
+       subtitle = "Con intervalo de confianza al 95%",
+       x = NULL, y = "Variación mensual (%)", color = NULL, linetype = NULL) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+gridExtra::grid.arrange(p1, p2, nrow = 2)
+```
+
+---
+
+# Conclusiones
+
+```{r conclusiones}
+cat(sprintf("MODELO GANADOR: %s\n\n", mejor$Modelo))
+
+cat("Resumen de resultados:\n")
+cat("—————————————————————————————————————————\n")
+cat(sprintf("• Criterio de información AIC: %s\n", mejor$AIC))
+cat(sprintf("• Criterio de información BIC: %s\n", mejor$BIC))
+cat(sprintf("• Ljung-Box (ruido blanco): %s\n",
+            ifelse(lb_check, "Aprobado", "No aprobado")))
+cat(sprintf("• Jarque-Bera (normalidad): %s (p=%.4f)\n",
+            ifelse(jb_check, "Aprobado", "No aprobado"), jb$p.value))
+cat(sprintf("• Raíces inversas: %s\n",
+            ifelse(raices_check, "Todas dentro del círculo unitario",
+                   "Alguna raíz fuera del círculo")))
+cat("—————————————————————————————————————————\n\n")
+
+cat("Proyección para el segundo semestre de 2026:\n")
+cat(sprintf("• Inflación mensual promedio proyectada: %.4f%%\n",
+            mean(pronostico$mean)))
+cat(sprintf("• IPC proyectado a diciembre 2026: %.4f\n",
+            tail(ipc_proy, 1)))
+if (length(inf_interanual_proy) > 0 && !any(is.na(inf_interanual_proy))) {
+  cat(sprintf("• Inflación interanual proyectada a dic 2026: %.2f%%\n",
+              tail(inf_interanual_proy, 1)))
+}
+```
+
+---
+
+*Documento generado automáticamente mediante R Markdown y la metodología de Box-Jenkins.*
+*Paquetes utilizados: forecast, tseries, urca, lmtest, ggplot2.*
