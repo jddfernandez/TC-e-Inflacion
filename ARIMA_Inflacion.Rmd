@@ -4,12 +4,11 @@ title: "Proyección de Inflación en Bolivia"
 subtitle: "Modelo ARIMA — Metodología de Box-Jenkins"
 author: "Análisis Econométrico"
 date: "`r format(Sys.Date(), '%d de %B de %Y')`"
-output: 
+output:
   html_document:
     toc: true
     toc_depth: 2
-    toc_float:
-      collapsed: false
+    toc_float: { collapsed: false }
     theme: flatly
     highlight: tango
     number_sections: true
@@ -17,662 +16,298 @@ output:
 ---
 
 <style>
-.title, .subtitle, .author, .date {
-  text-align: center;
-}
-.subtitle {
-  font-size: 18px;  
-  color: #7f8c8d;     
-  font-style: italic; 
+.title,.subtitle,.author,.date { text-align:center; }
+.subtitle { font-size:18px; color:#7f8c8d; font-style:italic; }
 </style>
 
-
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo       = FALSE,
-  message    = FALSE,
-  warning    = FALSE,
-  fig.width  = 10,
-  fig.height = 5.5,
-  fig.align  = "center",
-  comment    = "#>"
-)
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
+  fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
 
 required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
                "tseries","urca","lmtest","kableExtra","scales","gridExtra")
 new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
-if (length(new_pkg)) install.packages(new_pkg, repos = "https://cloud.r-project.org")
+if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
 
-library(readxl);  library(dplyr);    library(lubridate)
-library(ggplot2); library(forecast); library(tseries)
-library(urca);    library(lmtest);   library(kableExtra)
-library(scales);  library(gridExtra)
+library(readxl);library(dplyr);library(lubridate);library(ggplot2)
+library(forecast);library(tseries);library(urca);library(lmtest)
+library(kableExtra);library(scales);library(gridExtra)
 
-tema <- theme_minimal(base_size = 12) +
-  theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 13),
-        plot.subtitle = element_text(hjust = 0.5, color = "grey40", size = 10),
-        panel.grid.minor = element_blank(),
-        legend.position = "bottom")
+tema <- theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
+        plot.subtitle=element_text(hjust=0.5,color="grey40",size=10),
+        panel.grid.minor=element_blank(), legend.position="bottom")
 theme_set(tema)
 
-RUTA_BD     <- "Inputs/BD Bruta.xlsx"
-ANIO_INICIO <- 2023
-H_BACKTEST  <- 6
-H_FORECAST  <- 7
+RUTA_BD <- "Inputs/BD Bruta.xlsx"; ANIO_INICIO <- 2023
+H_BACKTEST <- 6; H_FORECAST <- 7; MAX_P <- 4; MAX_Q <- 4
 ```
 
-```{r carga-datos, include=FALSE}
+```{r carga, include=FALSE}
 meses_map <- c("Enero"=1,"Febrero"=2,"Marzo"=3,"Abril"=4,"Mayo"=5,
                "Junio"=6,"Julio"=7,"Agosto"=8,"Septiembre"=9,
                "Octubre"=10,"Noviembre"=11,"Diciembre"=12)
-
-ipc_raw <- read_excel(RUTA_BD, sheet = "IPC")
-
+ipc_raw <- read_excel(RUTA_BD, sheet="IPC")
 ipc <- ipc_raw %>%
-  mutate(Valor_num = suppressWarnings(as.numeric(Valor))) %>%
-  filter(!is.na(Valor_num)) %>%
-  mutate(mes_num = meses_map[Mes],
-         fecha   = as.Date(paste(Año, mes_num, "01", sep = "-")),
-         IPC     = Valor_num) %>%
-  arrange(fecha) %>%
-  select(fecha, Año, Mes, mes_num, IPC) %>%
-  mutate(inf_mensual    = (IPC / lag(IPC)     - 1) * 100,
-         inf_interanual = (IPC / lag(IPC, 12) - 1) * 100)
+  mutate(Valor_num=suppressWarnings(as.numeric(Valor))) %>% filter(!is.na(Valor_num)) %>%
+  mutate(mes_num=meses_map[Mes], fecha=as.Date(paste(Año,mes_num,"01",sep="-")), IPC=Valor_num) %>%
+  arrange(fecha) %>% select(fecha,Año,Mes,mes_num,IPC) %>%
+  mutate(log_IPC=log(IPC), inf_mensual=(IPC/lag(IPC)-1)*100, inf_interanual=(IPC/lag(IPC,12)-1)*100)
 
-tc_raw <- read_excel(RUTA_BD, sheet = "TC")
-names(tc_raw) <- trimws(names(tc_raw))
-
+tc_raw <- read_excel(RUTA_BD, sheet="TC"); names(tc_raw) <- trimws(names(tc_raw))
 tc_mensual <- tc_raw %>%
-  mutate(fecha_date = as.Date(fecha),
-         anio = year(fecha_date), mes = month(fecha_date)) %>%
-  group_by(anio, mes) %>%
-  summarise(TC_preferencial = mean(`TC PREFERENCIAL`, na.rm = TRUE),
-            TC_digital      = mean(`TC-DIGITAL`,      na.rm = TRUE),
-            TC_oficial      = first(`TC-OFICIAL`),
-            TC_referencial  = mean(`TC-REFERENCIAL`,   na.rm = TRUE),
-            .groups = "drop") %>%
-  mutate(fecha = as.Date(paste(anio, mes, "01", sep = "-")))
+  mutate(fecha_date=as.Date(fecha), anio=year(fecha_date), mes=month(fecha_date)) %>%
+  group_by(anio,mes) %>%
+  summarise(TC_preferencial=mean(`TC PREFERENCIAL`,na.rm=TRUE),TC_digital=mean(`TC-DIGITAL`,na.rm=TRUE),
+            TC_oficial=first(`TC-OFICIAL`),TC_referencial=mean(`TC-REFERENCIAL`,na.rm=TRUE),.groups="drop") %>%
+  mutate(fecha=as.Date(paste(anio,mes,"01",sep="-")))
 
-bd_mensual <- ipc %>%
-  filter(year(fecha) >= ANIO_INICIO) %>%
-  left_join(tc_mensual %>% select(fecha, starts_with("TC_")), by = "fecha")
+ipc_analisis <- ipc %>% filter(year(fecha)>=ANIO_INICIO, !is.na(inf_mensual))
+ipc_log      <- ipc %>% filter(year(fecha)>=ANIO_INICIO, !is.na(IPC))
+bd_mensual   <- ipc_analisis %>% left_join(tc_mensual %>% select(fecha,starts_with("TC_")), by="fecha")
 
-ipc_analisis <- ipc %>% filter(year(fecha) >= ANIO_INICIO, !is.na(inf_mensual))
-
-inf_ts <- ts(ipc_analisis$inf_mensual,
-             start = c(year(min(ipc_analisis$fecha)),
-                       month(min(ipc_analisis$fecha))),
-             frequency = 12)
+inf_ts <- ts(ipc_analisis$inf_mensual, start=c(year(min(ipc_analisis$fecha)),month(min(ipc_analisis$fecha))), frequency=12)
+log_ipc_ts <- ts(ipc_log$log_IPC, start=c(year(min(ipc_log$fecha)),month(min(ipc_log$fecha))), frequency=12)
+dlog_ipc_ts <- diff(log_ipc_ts)
 ```
 
 # Comportamiento de las Variables
 
-## Evolución del IPC e inflación
+```{r graficos, fig.height=10}
+p1 <- ipc_analisis %>% ggplot(aes(fecha,IPC)) + geom_line(color="#2c3e50",linewidth=0.8) +
+  geom_point(color="#2c3e50",size=1) + labs(title="IPC (base 2017=100)",x=NULL,y="IPC") +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
 
-```{r graficos-variables, fig.height=10}
-p1 <- ipc %>% filter(year(fecha) >= ANIO_INICIO) %>%
-  ggplot(aes(fecha, IPC)) +
-  geom_line(color = "#2c3e50", linewidth = 0.8) +
-  geom_point(color = "#2c3e50", size = 1) +
-  labs(title = "Índice de Precios al Consumidor (base 2017 = 100)",
-       x = NULL, y = "IPC") +
-  scale_x_date(date_breaks = "4 months", date_labels = "%b %Y") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p2 <- ipc_analisis %>% ggplot(aes(fecha,inf_mensual)) +
+  geom_col(fill=ifelse(ipc_analisis$inf_mensual>=0,"#3498db","#e74c3c"),alpha=0.7,width=25) +
+  geom_hline(yintercept=0,linewidth=0.3) +
+  labs(title="M1: Inflación mensual (%)",x=NULL,y="Var. mensual (%)") +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
 
-p2 <- ipc_analisis %>%
-  ggplot(aes(fecha, inf_mensual)) +
-  geom_col(fill = ifelse(ipc_analisis$inf_mensual >= 0, "#3498db", "#e74c3c"),
-           alpha = 0.7, width = 25) +
-  geom_hline(yintercept = mean(ipc_analisis$inf_mensual),
-             linetype = "dashed", color = "#2c3e50", linewidth = 0.5) +
-  labs(title = "Inflación mensual (%)",
-       subtitle = paste0("Media = ", round(mean(ipc_analisis$inf_mensual), 3), "%"),
-       x = NULL, y = "Var. mensual (%)") +
-  scale_x_date(date_breaks = "4 months", date_labels = "%b %Y") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+dlog_df <- data.frame(fecha=ipc_log$fecha[-1], dlog=as.numeric(dlog_ipc_ts))
+p3 <- dlog_df %>% ggplot(aes(fecha,dlog)) +
+  geom_col(fill=ifelse(dlog_df$dlog>=0,"#8e44ad","#e74c3c"),alpha=0.7,width=25) +
+  geom_hline(yintercept=0,linewidth=0.3) +
+  labs(title=expression("M2: "*Delta*"log(IPC)"),x=NULL,y=expression(Delta*"log(IPC)")) +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
 
-p3 <- ipc %>% filter(year(fecha) >= ANIO_INICIO, !is.na(inf_interanual)) %>%
-  ggplot(aes(fecha, inf_interanual)) +
-  geom_area(fill = "#27ae60", alpha = 0.2) +
-  geom_line(color = "#27ae60", linewidth = 0.8) +
-  geom_point(color = "#27ae60", size = 1) +
-  labs(title = "Inflación interanual (%)", x = NULL, y = "Var. 12 meses (%)") +
-  scale_x_date(date_breaks = "4 months", date_labels = "%b %Y") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-grid.arrange(p1, p2, p3, ncol = 1)
+grid.arrange(p1, p2, p3, ncol=1)
 ```
 
-## Estadísticas descriptivas
-
-```{r descriptivas}
-x <- as.numeric(inf_ts)
-n <- length(x)
-xc <- x - mean(x)
-
-data.frame(
-  Estadistico = c("Observaciones", "Media", "Mediana", "Desv. Estándar",
-                   "Mínimo", "Máximo", "Asimetría", "Curtosis"),
-  Valor = c(n, round(mean(x), 4), round(median(x), 4), round(sd(x), 4),
-            round(min(x), 4), round(max(x), 4),
-            round(sum(xc^3)/n / sd(x)^3, 4),
-            round(sum(xc^4)/n / sd(x)^4, 4))
-) %>%
-  kable(col.names = c("Estadístico", "Valor"),
-        caption = "Inflación mensual (%) — Estadísticas descriptivas",
-        align = c("l", "r")) %>%
-  kable_styling(bootstrap_options = c("striped","hover"),
-                full_width = FALSE, position = "center")
-```
-
-```{r histograma, fig.height=4}
-data.frame(x = x) %>%
-  ggplot(aes(x)) +
-  geom_histogram(aes(y = after_stat(density)), bins = 15,
-                 fill = "#3498db", alpha = 0.6, color = "white") +
-  geom_density(color = "#e74c3c", linewidth = 1) +
-  geom_vline(xintercept = mean(x), linetype = "dashed", color = "#2c3e50") +
-  labs(title = "Distribución de la inflación mensual",
-       x = "Variación mensual (%)", y = "Densidad")
-```
-
----
-
-# Base de Datos Mensual Consolidada
-
-La siguiente tabla combina el IPC, las medidas de inflación y los tipos de cambio mensualizados en una sola base desde `r ANIO_INICIO`.
+## Base de datos consolidada
 
 ```{r tabla-bd}
-bd_display <- bd_mensual %>%
-  transmute(
-    Fecha  = format(fecha, "%b %Y"),
-    IPC    = round(IPC, 2),
-    `Inf. mensual (%)` = round(inf_mensual, 3),
-    `Inf. interanual (%)` = round(inf_interanual, 2),
-    `TC Preferencial` = round(TC_preferencial, 2),
-    `TC Digital`      = round(TC_digital, 2),
-    `TC Oficial`      = TC_oficial
-  )
-
-kable(bd_display, caption = "Base de datos mensual consolidada", align = "r") %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = TRUE, font_size = 11) %>%
-  scroll_box(height = "420px")
+bd_mensual %>%
+  transmute(Fecha=format(fecha,"%b %Y"), IPC=round(IPC,2), `log(IPC)`=round(log_IPC,4),
+            `Inf.mens.(%)`=round(inf_mensual,3), `Inf.ia.(%)`=round(inf_interanual,2),
+            `TC Pref.`=round(TC_preferencial,2), `TC Oficial`=TC_oficial) %>%
+  kable(caption="Base mensual consolidada",align="r") %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=TRUE,font_size=11) %>%
+  scroll_box(height="380px")
 ```
 
 ---
 
-# Identificación, Estimación y Selección del Modelo
+# Identificación y Estacionariedad
 
 ```{r estacionariedad, include=FALSE}
-ipc_nivel_ts <- ts(ipc$IPC[ipc$Año >= ANIO_INICIO & !is.na(ipc$IPC)],
-                   start = c(ANIO_INICIO, 1), frequency = 12)
-
-adf_nivel  <- adf.test(ipc_nivel_ts)
-adf_inf    <- adf.test(inf_ts)
-pp_nivel   <- pp.test(ipc_nivel_ts)
-pp_inf     <- pp.test(inf_ts)
-kpss_nivel <- kpss.test(ipc_nivel_ts, null = "Level")
-kpss_inf   <- kpss.test(inf_ts, null = "Level")
-d_rec      <- ndiffs(inf_ts, test = "adf")
+adf_inf <- adf.test(inf_ts); pp_inf <- pp.test(inf_ts); kpss_inf <- kpss.test(inf_ts,null="Level")
+adf_log <- adf.test(log_ipc_ts); pp_log <- pp.test(log_ipc_ts); kpss_log <- kpss.test(log_ipc_ts,null="Level")
+adf_dlog <- adf.test(dlog_ipc_ts); pp_dlog <- pp.test(dlog_ipc_ts); kpss_dlog <- kpss.test(dlog_ipc_ts,null="Level")
 ```
-
-## Pruebas de estacionariedad
 
 ```{r tabla-raiz}
-concl <- function(p, tipo) {
-  if (tipo == "adf") return(ifelse(p < 0.05, "Estacionaria", "No estacionaria"))
-  if (tipo == "kpss") return(ifelse(p < 0.05, "No estacionaria", "Estacionaria"))
-}
-
+cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
 data.frame(
-  Prueba = c("ADF", "Phillips-Perron", "KPSS", "ADF", "Phillips-Perron", "KPSS"),
-  Serie  = c(rep("IPC (nivel)", 3), rep("Inflación mensual", 3)),
-  Estadistico = round(c(adf_nivel$statistic, pp_nivel$statistic, kpss_nivel$statistic,
-                         adf_inf$statistic,   pp_inf$statistic,   kpss_inf$statistic), 4),
-  p_valor = round(c(adf_nivel$p.value, pp_nivel$p.value, kpss_nivel$p.value,
-                     adf_inf$p.value,   pp_inf$p.value,   kpss_inf$p.value), 4),
-  Conclusion = c(concl(adf_nivel$p.value,"adf"), concl(pp_nivel$p.value,"adf"),
-                 concl(kpss_nivel$p.value,"kpss"),
-                 concl(adf_inf$p.value,"adf"), concl(pp_inf$p.value,"adf"),
-                 concl(kpss_inf$p.value,"kpss"))
+  Prueba=rep(c("ADF","PP","KPSS"),3),
+  Serie=c(rep("Inf. mensual (M1)",3),rep("log(IPC) (M2)",3),rep("Δlog(IPC)",3)),
+  Stat=round(c(adf_inf$stat,pp_inf$stat,kpss_inf$stat,adf_log$stat,pp_log$stat,kpss_log$stat,
+               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat),4),
+  p=round(c(adf_inf$p.value,pp_inf$p.value,kpss_inf$p.value,adf_log$p.value,pp_log$p.value,kpss_log$p.value,
+            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value),4),
+  Conclusion=c(cn(adf_inf$p.value,"adf"),cn(pp_inf$p.value,"adf"),cn(kpss_inf$p.value,"kpss"),
+               cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),
+               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"))
 ) %>%
-  kable(col.names = c("Prueba","Serie","Estadístico","p-valor","Conclusión"),
-        caption = "Pruebas de raíz unitaria (significancia al 5%)",
-        align = c("l","l","r","r","l")) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
-  pack_rows("IPC en nivel", 1, 3) %>%
-  pack_rows("Inflación mensual", 4, 6)
+  kable(col.names=c("Prueba","Serie","Estadístico","p-valor","Conclusión"),
+        caption="Pruebas de raíz unitaria",align=c("l","l","r","r","l")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
+  pack_rows("M1: Inflación mensual",1,3) %>% pack_rows("M2: log(IPC)",4,6) %>% pack_rows("Δlog(IPC)",7,9)
 ```
 
-> Diferenciación recomendada: **d = `r d_rec`** (ndiffs con ADF). El IPC en nivel es no estacionario; la inflación mensual es la variable de modelación.
-
-## Funciones de autocorrelación
-
-```{r acf-pacf, fig.height=4.5}
-par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
-Acf(inf_ts,  lag.max = 24, main = "ACF — Inflación mensual")
-Pacf(inf_ts, lag.max = 24, main = "PACF — Inflación mensual")
-par(mfrow = c(1, 1))
+```{r acf-pacf, fig.height=5}
+par(mfrow=c(2,2),mar=c(4,4,3,1))
+Acf(inf_ts,lag.max=24,main="ACF — M1: Inf. mensual")
+Pacf(inf_ts,lag.max=24,main="PACF — M1: Inf. mensual")
+Acf(dlog_ipc_ts,lag.max=24,main="ACF — M2: Δlog(IPC)")
+Pacf(dlog_ipc_ts,lag.max=24,main="PACF — M2: Δlog(IPC)")
+par(mfrow=c(1,1))
 ```
 
-```{r acf-sig}
-lim <- qnorm(0.975) / sqrt(length(inf_ts))
-acf_v  <- Acf(inf_ts,  lag.max = 24, plot = FALSE)
-pacf_v <- Pacf(inf_ts, lag.max = 24, plot = FALSE)
-acf_sig  <- which(abs(acf_v$acf[-1]) > lim)
-pacf_sig <- which(abs(pacf_v$acf) > lim)
-```
+---
 
-| | Rezagos significativos |
-|:---|:---|
-| **ACF** | `r if(length(acf_sig)) paste(acf_sig, collapse=", ") else "Ninguno"` |
-| **PACF** | `r if(length(pacf_sig)) paste(pacf_sig, collapse=", ") else "Ninguno"` |
-
-## Estimación de modelos candidatos
-
-Dado que `ndiffs = `r d_rec`` y las pruebas PP/KPSS/ADF confirman que la inflación mensual puede tratarse como estacionaria, la **selección principal** se realiza sobre modelos con $d = 0$ (modelan la inflación en nivel). Los modelos con $d = 1$ — que modelan *cambios* en la inflación — se presentan como **análisis de sensibilidad** y no compiten en la selección del modelo ganador.
+# Estimación y Selección — Dos Métodos
 
 ```{r estimacion, include=FALSE}
-ajustar <- function(serie, orden) {
-  tryCatch({
-    mod <- Arima(serie, order = orden, method = "ML")
-    list(modelo = mod, orden = orden, aic = AIC(mod), bic = BIC(mod),
-         aicc = mod$aicc, loglik = as.numeric(logLik(mod)),
-         npar = length(coef(mod)) + 1, converged = TRUE)
-  }, error = function(e) {
-    list(modelo = NULL, orden = orden, aic = NA, bic = NA, aicc = NA,
-         loglik = NA, npar = NA, converged = FALSE)
-  })
+estimar_grilla <- function(serie, max_p=MAX_P, max_q=MAX_Q) {
+  res <- data.frame()
+  for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) {
+    if(p==0&&d==0&&q==0) next
+    fit <- try(Arima(serie,order=c(p,d,q),method="ML"),silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb12 <- tryCatch(Box.test(residuals(fit),lag=12,type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+      res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)",p,d,q),p=p,d=d,q=q,
+        AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
+        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        LogLik=ll,LB12=lb12,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
+    }
+  }
+  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
+    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB12)|LB12<0.05,1,0),
+    R_p=ifelse(!Raices_ok,1,0),
+    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
 }
 
-diagnosticar <- function(r) {
-  if (!r$converged) return(NULL)
-  mod <- r$modelo; res <- residuals(mod); np <- length(coef(mod)); o <- r$orden
-  lb <- sapply(c(6,12,18), function(h)
-    tryCatch(Box.test(res,lag=h,type="Ljung-Box",fitdf=np)$p.value, error=function(e) NA))
-  jb <- tryCatch(jarque.bera.test(res)$p.value, error = function(e) NA)
-  arc <- mod$model$phi; mac <- mod$model$theta; rok <- TRUE
-  if (length(arc)>0 && any(arc!=0)) rok <- rok && all(Mod(1/polyroot(c(1,-arc)))<1)
-  if (length(mac)>0 && any(mac!=0)) rok <- rok && all(Mod(1/polyroot(c(1, mac)))<1)
-  lb_ok <- all(lb > 0.05, na.rm = TRUE)
-  data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)",o[1],o[2],o[3]),
-             p=o[1], d=o[2], q=o[3],
-             AIC=round(r$aic,2), BIC=round(r$bic,2), AICc=round(r$aicc,2),
-             LB_ok=lb_ok, JB_pval=round(jb,3), Raices_ok=rok,
-             Diag=ifelse(lb_ok & rok, "APROBADO","NO APROBADO"),
-             stringsAsFactors=FALSE)
-}
-
-## Bloque principal: modelos estacionarios (d=0)
-ordenes_principal <- list(
-  c(1,0,0), c(2,0,0), c(3,0,0), c(4,0,0),
-  c(0,0,1), c(0,0,2), c(0,0,3),
-  c(1,0,1), c(2,0,1), c(1,0,2), c(2,0,2),
-  c(3,0,1), c(1,0,3))
-
-res_principal  <- lapply(ordenes_principal, function(o) ajustar(inf_ts, o))
-eval_principal <- do.call(rbind, lapply(res_principal, diagnosticar))
-eval_principal <- eval_principal[order(eval_principal$AIC), ]
-
-aprobados <- eval_principal %>% filter(Diag == "APROBADO")
-if (nrow(aprobados) > 0) { mejor <- aprobados[1, ] } else { mejor <- eval_principal[1, ] }
-modelo_ganador <- Arima(inf_ts, order = c(mejor$p, mejor$d, mejor$q), method = "ML")
-
-## Bloque de sensibilidad: modelos con diferenciacion (d=1)
-ordenes_sensibilidad <- list(
-  c(0,1,1), c(1,1,0), c(1,1,1),
-  c(2,1,0), c(2,1,1), c(0,1,2), c(1,1,2))
-
-res_sensibilidad  <- lapply(ordenes_sensibilidad, function(o) ajustar(inf_ts, o))
-eval_sensibilidad <- do.call(rbind, lapply(res_sensibilidad, diagnosticar))
-eval_sensibilidad <- eval_sensibilidad[order(eval_sensibilidad$AIC), ]
-
-## auto.arima
-auto_fit   <- auto.arima(inf_ts, seasonal=TRUE, stepwise=FALSE, approximation=FALSE)
-auto_orden <- arimaorder(auto_fit)
-
-## Tabla combinada para backtesting
-resultados <- c(res_principal, res_sensibilidad)
+results_m1 <- estimar_grilla(inf_ts)
+results_m2 <- estimar_grilla(log_ipc_ts)
+mejor_m1 <- results_m1[1,]; mejor_m2 <- results_m2[1,]
+modelo_m1 <- Arima(inf_ts,order=c(mejor_m1$p,mejor_m1$d,mejor_m1$q),method="ML")
+modelo_m2 <- Arima(log_ipc_ts,order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
 ```
 
-### Selección principal ($d = 0$)
+El scoring compuesto integra: **RMSE** + **MAPE** + promedio(**AICc**, **BIC**, **Hannan-Quinn**) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
 
-```{r tabla-principal}
-eval_principal %>%
-  transmute(Modelo, AIC, BIC, AICc,
-            `Ljung-Box` = ifelse(LB_ok, "Sí", "No"),
-            `JB (p-val)` = JB_pval,
-            `Raíces OK` = ifelse(Raices_ok, "Sí", "No"),
-            Diagnóstico = Diag) %>%
-  kable(caption = paste0("Selección principal — ",
-                         nrow(eval_principal), " modelos estacionarios (d=0)"),
-        align = c("l", rep("r", 4), "c", "r", "c", "c")) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = FALSE, font_size = 11) %>%
-  row_spec(which(eval_principal$Diag == "APROBADO"), background = "#d5f5e3") %>%
-  row_spec(1, bold = TRUE, color = "white", background = "#27ae60")
+## M1: Método Directo (inflación mensual %)
+
+```{r tabla-m1}
+results_m1 %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,4), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("M1 Directo — Top 15 de %d modelos (variable: inflación mensual %%)",nrow(results_m1)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#e74c3c") %>% column_spec(10,bold=TRUE)
 ```
 
-### Sensibilidad ($d = 1$)
+## M2: Método Logarítmico (log IPC)
 
-Los modelos con $d = 1$ internamente trabajan con la primera diferencia de la serie, es decir, modelan los *cambios* en la inflación mensual. No son directamente comparables con los modelos en nivel.
-
-```{r tabla-sensibilidad}
-eval_sensibilidad %>%
-  transmute(Modelo, AIC, BIC, AICc,
-            `Ljung-Box` = ifelse(LB_ok, "Sí", "No"),
-            `JB (p-val)` = JB_pval,
-            `Raíces OK` = ifelse(Raices_ok, "Sí", "No"),
-            Diagnóstico = Diag) %>%
-  kable(caption = paste0("Sensibilidad — ",
-                         nrow(eval_sensibilidad), " modelos con diferenciación (d=1)"),
-        align = c("l", rep("r", 4), "c", "r", "c", "c")) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = FALSE, font_size = 11) %>%
-  row_spec(which(eval_sensibilidad$Diag == "APROBADO"), background = "#fdebd0")
+```{r tabla-m2}
+results_m2 %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("M2 Logarítmico — Top 15 de %d modelos (variable: log IPC)",nrow(results_m2)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
 ```
 
-> `auto.arima()` seleccionó **ARIMA(`r auto_orden[1]`,`r auto_orden[2]`,`r auto_orden[3]`)** (AIC = `r round(AIC(auto_fit),2)`, $d$ = `r auto_orden[2]`).
+## Comparación de ganadores
 
-### Sensibilidad — Muestra común ($n = 40$)
-
-Para verificar la robustez de la selección, se re-estiman **todos** los modelos (d=0 y d=1) sobre una ventana común de 40 observaciones. Dado que los modelos con $d=1$ pierden una observación por la diferenciación, esta prueba los pone en igualdad de condiciones. El AIC/BIC de esta tabla se compara internamente, no contra la muestra completa.
-
-```{r sensibilidad-40, include=FALSE}
-inf_ts_40 <- tail(inf_ts, 40)
-fecha_inicio_40 <- ipc_analisis$fecha[length(ipc_analisis$fecha) - 40 + 1]
-inf_ts_40 <- ts(as.numeric(inf_ts_40),
-                start = c(year(fecha_inicio_40), month(fecha_inicio_40)),
-                frequency = 12)
-
-ordenes_todos_40 <- c(ordenes_principal, ordenes_sensibilidad)
-res_40  <- lapply(ordenes_todos_40, function(o) ajustar(inf_ts_40, o))
-eval_40 <- do.call(rbind, lapply(res_40, diagnosticar))
-eval_40 <- eval_40[order(eval_40$AIC), ]
-
-aprobados_40 <- eval_40 %>% filter(Diag == "APROBADO")
-mejor_40 <- if (nrow(aprobados_40) > 0) aprobados_40[1, ] else eval_40[1, ]
-robusto  <- mejor_40$Modelo == mejor$Modelo
-```
-
-```{r tabla-n40}
-eval_40 %>%
-  transmute(Modelo, AIC, BIC, AICc,
-            `Ljung-Box` = ifelse(LB_ok, "Sí", "No"),
-            `JB (p-val)` = JB_pval,
-            `Raíces OK` = ifelse(Raices_ok, "Sí", "No"),
-            Diagnóstico = Diag) %>%
-  kable(caption = sprintf("Sensibilidad — Todos los modelos sobre muestra común (n=%d, desde %s)",
-                          length(inf_ts_40), format(fecha_inicio_40, "%b %Y")),
-        align = c("l", rep("r", 4), "c", "r", "c", "c")) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = FALSE, font_size = 11) %>%
-  row_spec(which(eval_40$Diag == "APROBADO"), background = "#eaf2f8") %>%
-  row_spec(1, bold = TRUE, color = "white", background = "#2980b9")
-```
-
-> **Mejor modelo en $n=40$:** `r mejor_40$Modelo` (AIC = `r mejor_40$AIC`). Modelo principal: `r mejor$Modelo`. Resultado: **`r ifelse(robusto, "ROBUSTO — la selección se mantiene", "SENSIBLE — el ganador cambia con la ventana reducida")`**.
-
-### Sensibilidad — Muestra compatible con AR(4) ($n = 37$)
-
-El modelo con mayor número de rezagos en la grilla es AR(4), que consume 4 observaciones iniciales para la estimación. Un modelo ARIMA(0,1,1) en cambio solo consume 1 por la diferenciación y 1 por el MA. Para que la comparación de criterios de información sea estrictamente justa, se recorta la serie a las **últimas 37 observaciones** — el número efectivo que usa un AR(4) — y se re-estiman todos los candidatos sobre esa ventana idéntica.
-
-```{r sensibilidad-37, include=FALSE}
-N_COMPAT <- 37
-inf_ts_37 <- tail(inf_ts, N_COMPAT)
-fecha_inicio_37 <- ipc_analisis$fecha[length(ipc_analisis$fecha) - N_COMPAT + 1]
-inf_ts_37 <- ts(as.numeric(inf_ts_37),
-                start = c(year(fecha_inicio_37), month(fecha_inicio_37)),
-                frequency = 12)
-
-ordenes_todos_37 <- c(ordenes_principal, ordenes_sensibilidad)
-res_37  <- lapply(ordenes_todos_37, function(o) ajustar(inf_ts_37, o))
-eval_37 <- do.call(rbind, lapply(res_37, diagnosticar))
-eval_37 <- eval_37[order(eval_37$AIC), ]
-
-aprobados_37 <- eval_37 %>% filter(Diag == "APROBADO")
-mejor_37 <- if (nrow(aprobados_37) > 0) aprobados_37[1, ] else eval_37[1, ]
-robusto_37 <- mejor_37$Modelo == mejor$Modelo
-```
-
-```{r tabla-n37}
-eval_37 %>%
-  transmute(Modelo, AIC, BIC, AICc,
-            `Ljung-Box` = ifelse(LB_ok, "Sí", "No"),
-            `JB (p-val)` = JB_pval,
-            `Raíces OK` = ifelse(Raices_ok, "Sí", "No"),
-            Diagnóstico = Diag) %>%
-  kable(caption = sprintf("Sensibilidad — Todos los modelos sobre muestra compatible con AR(4) (n=%d, desde %s)",
-                          length(inf_ts_37), format(fecha_inicio_37, "%b %Y")),
-        align = c("l", rep("r", 4), "c", "r", "c", "c")) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = FALSE, font_size = 11) %>%
-  row_spec(which(eval_37$Diag == "APROBADO"), background = "#f5eef8") %>%
-  row_spec(1, bold = TRUE, color = "white", background = "#8e44ad")
-```
-
-> **Mejor modelo en $n=37$:** `r mejor_37$Modelo` (AIC = `r mejor_37$AIC`). Modelo principal: `r mejor$Modelo`. Resultado: **`r ifelse(robusto_37, "ROBUSTO — la selección se mantiene con información homogénea", "SENSIBLE — el ganador cambia cuando todos los modelos usan la misma información")`**.
-
-## Modelo ganador
-
-```{r cuadro-ganador}
-coefs   <- coef(modelo_ganador)
-se_vals <- sqrt(diag(vcov(modelo_ganador)))
-z_vals  <- coefs / se_vals
-p_vals  <- 2 * (1 - pnorm(abs(z_vals)))
-residuos <- residuals(modelo_ganador)
-jb <- jarque.bera.test(residuos)
-sw <- shapiro.test(residuos)
-lb_pvals <- sapply(c(6,12,18,24), function(h)
-  Box.test(residuos,lag=h,type="Ljung-Box",fitdf=length(coefs))$p.value)
-```
-
-:::::: {style="display:flex; gap:30px; flex-wrap:wrap; justify-content:center;"}
-
-::: {}
-
-```{r coefs-tabla}
+```{r comparacion-ganadores}
 data.frame(
-  Coeficiente = names(coefs),
-  Estimacion  = round(coefs, 5),
-  Err.Std     = round(se_vals, 5),
-  z           = round(z_vals, 3),
-  p           = round(p_vals, 4),
-  Sig         = ifelse(p_vals<0.01,"***",ifelse(p_vals<0.05,"**",ifelse(p_vals<0.1,"*","")))
+  Criterio=c("Modelo ganador","Score compuesto","AICc","BIC","Hannan-Quinn","RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
+  M1=c(mejor_m1$Modelo, round(mejor_m1$Score,3), round(mejor_m1$AICc,2), round(mejor_m1$BIC,2),
+       round(mejor_m1$HQ,2), round(mejor_m1$RMSE,6), round(mejor_m1$MAPE,4), round(mejor_m1$LB12,4)),
+  M2=c(mejor_m2$Modelo, round(mejor_m2$Score,3), round(mejor_m2$AICc,2), round(mejor_m2$BIC,2),
+       round(mejor_m2$HQ,2), round(mejor_m2$RMSE,6), round(mejor_m2$MAPE,4), round(mejor_m2$LB12,4))
 ) %>%
-  kable(col.names = c("Coeficiente","Estimación","Err. Std.","z","p-valor",""),
-        caption = paste0(mejor$Modelo, " — Coeficientes"),
-        align = c("l","r","r","r","r","c"), row.names = FALSE) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+  kable(col.names=c("Criterio","M1: Directo","M2: Logarítmico"),
+        caption="Comparación de modelos ganadores",align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
-
-:::
-
-::: {}
-
-```{r info-ganador}
-data.frame(
-  Criterio = c("AIC","BIC","AICc","Log-verosimilitud",
-               "Ljung-Box (h=6)","Ljung-Box (h=12)","Ljung-Box (h=18)","Ljung-Box (h=24)",
-               "Jarque-Bera","Shapiro-Wilk"),
-  Valor = c(round(AIC(modelo_ganador),2), round(BIC(modelo_ganador),2),
-            round(modelo_ganador$aicc,2), round(as.numeric(logLik(modelo_ganador)),2),
-            paste0("p=",round(lb_pvals[1],4)),paste0("p=",round(lb_pvals[2],4)),
-            paste0("p=",round(lb_pvals[3],4)),paste0("p=",round(lb_pvals[4],4)),
-            paste0("p=",round(jb$p.value,4)),paste0("p=",round(sw$p.value,4))),
-  Resultado = c("","","","",
-                ifelse(lb_pvals[1]>0.05,"Ruido blanco","Autocorr."),
-                ifelse(lb_pvals[2]>0.05,"Ruido blanco","Autocorr."),
-                ifelse(lb_pvals[3]>0.05,"Ruido blanco","Autocorr."),
-                ifelse(lb_pvals[4]>0.05,"Ruido blanco","Autocorr."),
-                ifelse(jb$p.value>0.05,"Normal","No normal"),
-                ifelse(sw$p.value>0.05,"Normal","No normal"))
-) %>%
-  kable(caption = paste0(mejor$Modelo, " — Diagnóstico"),
-        align = c("l","r","l")) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
-```
-
-:::
-
-::::::
-
-> `auto.arima()` seleccionó **ARIMA(`r auto_orden[1]`,`r auto_orden[2]`,`r auto_orden[3]`)** (AIC = `r round(AIC(auto_fit),2)`).
 
 ```{r diagnostico-graficos, fig.height=8}
-par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
-
-plot(residuos, main = "Residuos", ylab = "Residuos", col = "#2c3e50")
-abline(h = 0, col = "red", lty = 2)
-
-hist(residuos, breaks = 15, probability = TRUE, main = "Histograma de residuos",
-     col = "#3498db80", border = "white", xlab = "Residuos")
-curve(dnorm(x, mean(residuos), sd(residuos)), add=TRUE, col="#e74c3c", lwd=2)
-
-Acf(residuos,  main = "ACF de residuos",  lag.max = 20)
-
-qqnorm(residuos, main = "Q-Q Plot", col = "#2c3e50", pch = 16)
-qqline(residuos, col = "#e74c3c", lwd = 2)
-par(mfrow = c(1, 1))
-```
-
-```{r raices-inversas, fig.height=4}
-ar_c <- modelo_ganador$model$phi; ma_c <- modelo_ganador$model$theta
-tiene_ar <- length(ar_c) > 0 && any(ar_c != 0)
-tiene_ma <- length(ma_c) > 0 && any(ma_c != 0)
-
-if (tiene_ar || tiene_ma) {
-  theta_c <- seq(0, 2*pi, length.out = 200)
-  np <- tiene_ar + tiene_ma
-  if (np == 2) par(mfrow = c(1,2), mar = c(4,4,3,1))
-  if (tiene_ar) {
-    ai <- 1/polyroot(c(1,-ar_c))
-    plot(Re(ai),Im(ai),xlim=c(-1.5,1.5),ylim=c(-1.5,1.5),pch=19,col="#e74c3c",cex=2,asp=1,
-         main="Raíces inversas AR",xlab="Real",ylab="Imaginario")
-    lines(cos(theta_c),sin(theta_c),col="grey50",lwd=2); abline(h=0,v=0,lty=3,col="grey70")
-  }
-  if (tiene_ma) {
-    mi <- 1/polyroot(c(1,ma_c))
-    plot(Re(mi),Im(mi),xlim=c(-1.5,1.5),ylim=c(-1.5,1.5),pch=19,col="#2980b9",cex=2,asp=1,
-         main="Raíces inversas MA",xlab="Real",ylab="Imaginario")
-    lines(cos(theta_c),sin(theta_c),col="grey50",lwd=2); abline(h=0,v=0,lty=3,col="grey70")
-  }
-  par(mfrow = c(1,1))
-}
+par(mfrow=c(2,4),mar=c(4,3,3,1))
+r1<-residuals(modelo_m1); r2<-residuals(modelo_m2)
+plot(r1,main=paste("M1:",mejor_m1$Modelo),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
+hist(r1,breaks=12,prob=TRUE,main="M1: Histograma",col="#e74c3c40",border="white",xlab="")
+curve(dnorm(x,mean(r1),sd(r1)),add=TRUE,col="#e74c3c",lwd=2)
+Acf(r1,main="M1: ACF residuos",lag.max=18)
+qqnorm(r1,main="M1: Q-Q",col="#e74c3c",pch=16); qqline(r1,col="grey50",lwd=2)
+plot(r2,main=paste("M2:",mejor_m2$Modelo),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
+hist(r2,breaks=12,prob=TRUE,main="M2: Histograma",col="#2980b940",border="white",xlab="")
+curve(dnorm(x,mean(r2),sd(r2)),add=TRUE,col="#2980b9",lwd=2)
+Acf(r2,main="M2: ACF residuos",lag.max=18)
+qqnorm(r2,main="M2: Q-Q",col="#2980b9",pch=16); qqline(r2,col="grey50",lwd=2)
+par(mfrow=c(1,1))
 ```
 
 ---
 
 # Backtesting
 
-Se reservan los **últimos `r H_BACKTEST` meses** de datos observados como período de prueba. El modelo se re-estima con los datos de entrenamiento y se pronostica hacia adelante para evaluar la capacidad predictiva.
+Se reservan los últimos `r H_BACKTEST` meses. Ambos modelos se comparan en **niveles de IPC**.
 
 ```{r backtesting}
-n_total <- length(inf_ts)
-n_train <- n_total - H_BACKTEST
+ultimo_mes <- max(ipc_analisis$fecha)
+meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FORECAST)
+fechas_test <- tail(ipc_analisis$fecha, H_BACKTEST)
 
-train_ts <- window(inf_ts, end = time(inf_ts)[n_train])
-test_ts  <- window(inf_ts, start = time(inf_ts)[n_train + 1])
+## M1
+n1<-length(inf_ts); nt1<-n1-H_BACKTEST
+bt1<-Arima(window(inf_ts,end=time(inf_ts)[nt1]),order=c(mejor_m1$p,mejor_m1$d,mejor_m1$q),method="ML")
+fc1<-forecast(bt1,h=H_BACKTEST,level=c(80,95))
+ult_ipc_tr <- ipc_analisis$IPC[nt1]
+fc_inf1<-as.numeric(fc1$mean); ipc_fc1<-numeric(H_BACKTEST)
+ipc_fc1[1]<-ult_ipc_tr*(1+fc_inf1[1]/100)
+for(i in 2:H_BACKTEST) ipc_fc1[i]<-ipc_fc1[i-1]*(1+fc_inf1[i]/100)
 
-fechas_test  <- tail(ipc_analisis$fecha, H_BACKTEST)
-fechas_train <- head(ipc_analisis$fecha, n_train)
+## M2
+n2<-length(log_ipc_ts); nt2<-n2-H_BACKTEST
+bt2<-Arima(window(log_ipc_ts,end=time(log_ipc_ts)[nt2]),order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
+fc2<-forecast(bt2,h=H_BACKTEST,level=c(80,95))
+ipc_fc2<-exp(as.numeric(fc2$mean))
 
-modelo_bt <- Arima(train_ts, order = c(mejor$p, mejor$d, mejor$q), method = "ML")
-fc_bt     <- forecast(modelo_bt, h = H_BACKTEST, level = c(80, 95))
-
-actual_v   <- as.numeric(test_ts)
-forecast_v <- as.numeric(fc_bt$mean)
-error_v    <- forecast_v - actual_v
-pct_err    <- (error_v / abs(actual_v)) * 100
-lo95 <- as.numeric(fc_bt$lower[,2]); hi95 <- as.numeric(fc_bt$upper[,2])
-dentro_ic <- actual_v >= lo95 & actual_v <= hi95
-
-rmse <- sqrt(mean(error_v^2))
-mae  <- mean(abs(error_v))
-mape <- mean(abs(pct_err))
-me   <- mean(error_v)
+ipc_obs <- tail(ipc_analisis$IPC, H_BACKTEST)
+err1<-ipc_fc1-ipc_obs; err2<-ipc_fc2-ipc_obs
+rmse1<-sqrt(mean(err1^2)); rmse2<-sqrt(mean(err2^2))
+mape1<-mean(abs(err1/ipc_obs))*100; mape2<-mean(abs(err2/ipc_obs))*100
+lo95_2<-exp(as.numeric(fc2$lower[,2])); hi95_2<-exp(as.numeric(fc2$upper[,2]))
+dentro2<-ipc_obs>=lo95_2 & ipc_obs<=hi95_2
 ```
 
-## Comparación punto a punto
-
-```{r tabla-backtest}
-data.frame(
-  Fecha      = format(fechas_test, "%b %Y"),
-  Observado  = round(actual_v, 4),
-  Pronostico = round(forecast_v, 4),
-  Error      = round(error_v, 4),
-  IC95_inf   = round(lo95, 4),
-  IC95_sup   = round(hi95, 4),
-  Dentro_IC  = ifelse(dentro_ic, "Sí", "No")
-) %>%
-  kable(col.names = c("Fecha","Observado","Pronóstico","Error (pp)",
-                       "IC 95% inf","IC 95% sup","¿Dentro IC?"),
-        caption = "Backtesting — Pronóstico vs. observado",
-        align = c("l", rep("r",5), "c")) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
-  column_spec(7, bold = TRUE,
-              color = ifelse(dentro_ic, "#27ae60", "#e74c3c"))
+```{r tabla-bt}
+data.frame(Fecha=format(fechas_test,"%b %Y"), IPC_obs=round(ipc_obs,2),
+           M1_pron=round(ipc_fc1,2), M1_err=round(err1,2),
+           M2_pron=round(ipc_fc2,2), M2_err=round(err2,2)) %>%
+  kable(col.names=c("Fecha","IPC obs.","M1 pronóst.","M1 error","M2 pronóst.","M2 error"),
+        caption="Backtesting — IPC observado vs. pronosticado (ambos métodos)",align=c("l",rep("r",5))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
 ```{r metricas-bt}
-data.frame(
-  Metrica = c("RMSE","MAE","MAPE","Error medio (sesgo)",
-              "Obs. dentro del IC 95%"),
-  Valor = c(paste(round(rmse,4),"pp"), paste(round(mae,4),"pp"),
-            paste0(round(mape,1),"%"), paste(round(me,4),"pp"),
-            paste0(sum(dentro_ic),"/",H_BACKTEST," (",round(mean(dentro_ic)*100),"%)"))) %>%
-  kable(col.names = c("Métrica","Valor"),
-        caption = "Métricas de error del backtesting", align = c("l","r")) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+data.frame(Metrica=c("RMSE (IPC)","MAPE (IPC)"),
+           M1=c(round(rmse1,4), paste0(round(mape1,2),"%")),
+           M2=c(round(rmse2,4), paste0(round(mape2,2),"%"))) %>%
+  kable(col.names=c("Métrica","M1: Directo","M2: Logarítmico"),
+        caption="Métricas de backtesting comparadas",align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
-## Visualización del backtesting
+```{r grafico-bt, fig.height=5}
+bt_df <- bind_rows(
+  data.frame(fecha=fechas_test, IPC=ipc_obs, tipo="Observado"),
+  data.frame(fecha=fechas_test, IPC=ipc_fc1, tipo="M1 Directo"),
+  data.frame(fecha=fechas_test, IPC=ipc_fc2, tipo="M2 Logarítmico"))
+cols_bt <- c(Observado="#2c3e50",`M1 Directo`="#e74c3c",`M2 Logarítmico`="#2980b9")
 
-```{r grafico-backtest, fig.height=5.5}
-bt_df <- data.frame(
-  fecha = rep(fechas_test, 2),
-  valor = c(actual_v, forecast_v),
-  tipo  = rep(c("Observado","Pronóstico"), each = H_BACKTEST))
-
-bt_ci <- data.frame(fecha = fechas_test, lo80 = as.numeric(fc_bt$lower[,1]),
-                    hi80 = as.numeric(fc_bt$upper[,1]), lo95 = lo95, hi95 = hi95)
-
-ggplot() +
-  geom_ribbon(data = bt_ci, aes(fecha, ymin=lo95, ymax=hi95),
-              fill="#e74c3c", alpha=0.10) +
-  geom_ribbon(data = bt_ci, aes(fecha, ymin=lo80, ymax=hi80),
-              fill="#e74c3c", alpha=0.20) +
-  geom_line(data = data.frame(fecha=fechas_train, valor=as.numeric(train_ts)),
-            aes(fecha, valor), color="#bdc3c7", linewidth=0.4) +
-  geom_line(data = bt_df, aes(fecha, valor, color=tipo, linetype=tipo), linewidth=0.9) +
-  geom_point(data = bt_df, aes(fecha, valor, color=tipo), size=2.5) +
-  geom_segment(data = data.frame(fecha=fechas_test, obs=actual_v, pron=forecast_v),
-               aes(x=fecha,xend=fecha,y=obs,yend=pron),
-               color="#7f8c8d", linetype="dotted", linewidth=0.6) +
-  scale_color_manual(values = c(Observado="#2c3e50", `Pronóstico`="#e74c3c")) +
-  scale_linetype_manual(values = c(Observado="solid", `Pronóstico`="dashed")) +
-  labs(title = sprintf("Backtesting — %s (últimos %d meses)", mejor$Modelo, H_BACKTEST),
-       subtitle = sprintf("RMSE = %.4f pp  |  MAE = %.4f pp  |  Dentro IC 95%%: %d/%d",
-                          rmse, mae, sum(dentro_ic), H_BACKTEST),
-       x = NULL, y = "Inflación mensual (%)", color = NULL, linetype = NULL) +
-  scale_x_date(date_breaks = "2 months", date_labels = "%b %Y") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-```
-
-```{r barras-error, fig.height=3.5}
-data.frame(fecha = fechas_test, error = error_v) %>%
-  ggplot(aes(fecha, error, fill = error > 0)) +
-  geom_col(width = 20, alpha = 0.8, show.legend = FALSE) +
-  geom_hline(yintercept = 0, linewidth = 0.5) +
-  geom_hline(yintercept = c(-rmse, rmse), linetype="dashed", color="#e74c3c") +
-  annotate("text", x = min(fechas_test), y = rmse + 0.06,
-           label = paste0("±RMSE = ", round(rmse,3)), hjust=0, size=3.5, color="#e74c3c") +
-  scale_fill_manual(values = c("TRUE"="#e74c3c","FALSE"="#2980b9")) +
-  labs(title = "Error del backtesting (pronóstico − observado)",
-       x = NULL, y = "Error (pp)") +
-  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(bt_df, aes(fecha,IPC,color=tipo,linetype=tipo)) +
+  geom_line(linewidth=0.9) + geom_point(size=2.5) +
+  scale_color_manual(values=cols_bt) +
+  scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="dashed")) +
+  labs(title="Backtesting IPC — M1 vs M2",
+       subtitle=sprintf("M1 MAPE=%.2f%% | M2 MAPE=%.2f%%",mape1,mape2),
+       x=NULL,y="IPC",color=NULL,linetype=NULL) +
+  scale_x_date(date_breaks="1 month",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
 
 ---
@@ -680,104 +315,82 @@ data.frame(fecha = fechas_test, error = error_v) %>%
 # Pronóstico Final
 
 ```{r pronostico}
-pronostico <- forecast(modelo_ganador, h = H_FORECAST, level = c(80, 95))
+fc_f1<-forecast(modelo_m1,h=H_FORECAST,level=c(80,95))
+ult_ipc<-tail(ipc_analisis$IPC,1); fi1<-as.numeric(fc_f1$mean); ip1<-numeric(H_FORECAST)
+ip1[1]<-ult_ipc*(1+fi1[1]/100); for(i in 2:H_FORECAST) ip1[i]<-ip1[i-1]*(1+fi1[i]/100)
 
-ultimo_mes <- max(ipc_analisis$fecha)
-meses_pron <- seq.Date(ultimo_mes %m+% months(1), by = "month", length.out = H_FORECAST)
+fc_f2<-forecast(modelo_m2,h=H_FORECAST,level=c(80,95))
+ip2<-exp(as.numeric(fc_f2$mean))
+ip2_lo80<-exp(as.numeric(fc_f2$lower[,1])); ip2_hi80<-exp(as.numeric(fc_f2$upper[,1]))
+ip2_lo95<-exp(as.numeric(fc_f2$lower[,2])); ip2_hi95<-exp(as.numeric(fc_f2$upper[,2]))
 
-ultimo_ipc <- tail(ipc_analisis$IPC, 1)
-ipc_proy   <- numeric(H_FORECAST)
-ipc_proy[1] <- ultimo_ipc * (1 + pronostico$mean[1] / 100)
-for (i in 2:H_FORECAST) ipc_proy[i] <- ipc_proy[i-1] * (1 + pronostico$mean[i] / 100)
-
-ipc_comp    <- c(ipc$IPC[!is.na(ipc$IPC)], ipc_proy)
-fechas_comp <- c(ipc$fecha[!is.na(ipc$IPC)], meses_pron)
-
-inf_ia_proy <- sapply(seq_along(meses_pron), function(i) {
-  f12 <- meses_pron[i] %m-% months(12)
-  idx <- which.min(abs(fechas_comp - f12))
-  (ipc_proy[i] / ipc_comp[idx] - 1) * 100
-})
+ipc_h<-ipc$IPC[!is.na(ipc$IPC)]; fh<-ipc$fecha[!is.na(ipc$IPC)]
+der_ia <- function(ipv) {
+  ic<-c(ipc_h,ipv); fc<-c(fh,meses_pron)
+  sapply(seq_along(meses_pron),function(i)(ipv[i]/ic[which.min(abs(fc-(meses_pron[i]%m-%months(12))))]-1)*100)
+}
+ia1<-der_ia(ip1); ia2<-der_ia(ip2)
 ```
 
-## Proyección junio — diciembre 2026
+## Proyección comparada
 
-```{r tabla-pronostico}
-meses_nom <- c("Enero","Febrero","Marzo","Abril","Mayo","Junio",
-               "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre")
-
-data.frame(
-  Mes = meses_nom[month(meses_pron)],
-  IPC = round(ipc_proy, 2),
-  Inf_mens = round(as.numeric(pronostico$mean), 4),
-  Inf_ia   = round(inf_ia_proy, 2),
-  IC95_inf = round(as.numeric(pronostico$lower[,2]), 4),
-  IC95_sup = round(as.numeric(pronostico$upper[,2]), 4)
-) %>%
-  kable(col.names = c("Mes","IPC proyectado","Inf. mensual (%)","Inf. interanual (%)",
-                       "IC 95% inf","IC 95% sup"),
-        caption = "Proyección de inflación — Junio a Diciembre 2026",
-        align = c("l", rep("r",5))) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```{r tabla-proy}
+mn<-c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre")
+data.frame(Mes=mn[month(meses_pron)],
+           M1_IPC=round(ip1,2), M1_ia=round(ia1,2),
+           M2_IPC=round(ip2,2), M2_ia=round(ia2,2),
+           M2_lo95=round(ip2_lo95,2), M2_hi95=round(ip2_hi95,2)) %>%
+  kable(col.names=c("Mes","M1 IPC","M1 Inf.ia(%)","M2 IPC","M2 Inf.ia(%)","M2 IC95 inf","M2 IC95 sup"),
+        caption="Proyección IPC e inflación interanual — M1 vs M2",align=c("l",rep("r",6))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
-## Gráfico integrado
+## Fan Chart comparado
 
-```{r grafico-final, fig.height=6}
-hist_df <- ipc_analisis %>% select(fecha, inf_mensual) %>% mutate(tipo = "Histórico")
-bt_obs  <- data.frame(fecha=fechas_test, inf_mensual=actual_v, tipo="Backtest (obs.)")
-bt_pro  <- data.frame(fecha=fechas_test, inf_mensual=forecast_v, tipo="Backtest (pron.)")
-proy_df <- data.frame(fecha=meses_pron, inf_mensual=as.numeric(pronostico$mean),
-                      tipo="Proyección")
-ci_df   <- data.frame(fecha=meses_pron,
-                      lo95=as.numeric(pronostico$lower[,2]),
-                      hi95=as.numeric(pronostico$upper[,2]))
-
-plot_all <- bind_rows(hist_df, bt_obs, bt_pro, proy_df) %>%
-  mutate(tipo = factor(tipo, levels=c("Histórico","Backtest (obs.)",
-                                       "Backtest (pron.)","Proyección")))
-
-cols <- c("Histórico"="#2c3e50", "Backtest (obs.)"="#27ae60",
-          "Backtest (pron.)"="#e67e22", "Proyección"="#e74c3c")
-lins <- c("Histórico"="solid", "Backtest (obs.)"="solid",
-          "Backtest (pron.)"="dashed", "Proyección"="dashed")
+```{r fan-chart, fig.height=5.5}
+ipc_obs_df <- ipc %>% filter(year(fecha)>=ANIO_INICIO,!is.na(IPC)) %>% select(fecha,IPC)
+ci_fan <- data.frame(fecha=meses_pron,lo80=ip2_lo80,hi80=ip2_hi80,lo95=ip2_lo95,hi95=ip2_hi95)
 
 ggplot() +
-  geom_ribbon(data=ci_df, aes(fecha,ymin=lo95,ymax=hi95), fill="#e74c3c", alpha=0.12) +
-  geom_vline(xintercept = min(fechas_test), linetype="dotted", color="#7f8c8d") +
-  geom_vline(xintercept = ultimo_mes + 15, linetype="dotted", color="#7f8c8d") +
-  annotate("text", x=min(fechas_test)-25, y=max(plot_all$inf_mensual)*0.92,
-           label="Entrenamiento", hjust=1, size=3, color="#7f8c8d") +
-  annotate("text", x=min(fechas_test)+50, y=max(plot_all$inf_mensual)*0.92,
-           label="Backtest", hjust=0.5, size=3, color="#7f8c8d") +
-  annotate("text", x=ultimo_mes+70, y=max(plot_all$inf_mensual)*0.92,
-           label="Proyección", hjust=0, size=3, color="#7f8c8d") +
-  geom_line(data=plot_all, aes(fecha,inf_mensual,color=tipo,linetype=tipo), linewidth=0.8) +
-  geom_point(data=plot_all, aes(fecha,inf_mensual,color=tipo), size=1.5) +
-  geom_segment(data=data.frame(fecha=fechas_test, obs=actual_v, pron=forecast_v),
-               aes(x=fecha,xend=fecha,y=obs,yend=pron),
-               color="#7f8c8d", linetype="dotted", linewidth=0.5) +
-  scale_color_manual(values=cols) + scale_linetype_manual(values=lins) +
-  labs(title = sprintf("Inflación mensual — %s", mejor$Modelo),
-       subtitle = sprintf("Backtest RMSE=%.3f pp | Proyección a dic 2026", rmse),
-       x=NULL, y="Variación mensual (%)", color=NULL, linetype=NULL) +
-  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
+  geom_ribbon(data=ci_fan,aes(fecha,ymin=lo95,ymax=hi95),fill="#2980b9",alpha=0.10) +
+  geom_ribbon(data=ci_fan,aes(fecha,ymin=lo80,ymax=hi80),fill="#2980b9",alpha=0.22) +
+  geom_line(data=ipc_obs_df,aes(fecha,IPC),color="#2c3e50",linewidth=0.9) +
+  geom_line(data=data.frame(fecha=meses_pron,IPC=ip2),aes(fecha,IPC),color="blue",linewidth=0.9) +
+  geom_line(data=data.frame(fecha=meses_pron,IPC=ip1),aes(fecha,IPC),color="#e74c3c",linewidth=0.9,linetype="dashed") +
+  geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),aes(fecha,IPC),color="blue",size=3) +
+  geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),
+            aes(fecha,IPC,label=round(IPC,1)),vjust=-1,color="blue",size=4.5) +
+  geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),aes(fecha,IPC),color="#e74c3c",size=3) +
+  geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),
+            aes(fecha,IPC,label=round(IPC,1)),vjust=1.5,color="#e74c3c",size=4.5) +
+  geom_vline(xintercept=ultimo_mes+15,linetype="dotted",color="#7f8c8d") +
+  labs(title="Fan Chart — M1 (rojo punteado) vs M2 (azul sólido, con IC)",
+       subtitle=sprintf("M1: %s | M2: %s",mejor_m1$Modelo,mejor_m2$Modelo),x=NULL,y="IPC") +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
 
-```{r grafico-ipc-final, fig.height=4.5}
-ipc_all <- bind_rows(
-  ipc %>% filter(year(fecha)>=ANIO_INICIO, !is.na(IPC)) %>%
-    select(fecha, IPC) %>% mutate(tipo="Histórico"),
-  data.frame(fecha=meses_pron, IPC=ipc_proy, tipo="Proyectado"))
+## Inflación interanual observada y proyectada
 
-ggplot(ipc_all, aes(fecha, IPC, color=tipo, linetype=tipo)) +
-  geom_line(linewidth=0.8) + geom_point(size=1.5) +
-  geom_vline(xintercept=ultimo_mes+15, linetype="dotted", color="#7f8c8d") +
-  scale_color_manual(values=c(Histórico="#2c3e50", Proyectado="#e74c3c")) +
-  scale_linetype_manual(values=c(Histórico="solid", Proyectado="dashed")) +
-  labs(title="IPC histórico y proyectado", subtitle="Base 2017 = 100",
-       x=NULL, y="IPC", color=NULL, linetype=NULL) +
-  scale_x_date(date_breaks="4 months", date_labels="%b %Y") +
-  theme(axis.text.x = element_text(angle=45, hjust=1))
+```{r yoy, fig.height=4.5}
+ia_h <- ipc %>% filter(!is.na(inf_interanual),year(fecha)>=ANIO_INICIO) %>%
+  select(fecha,yoy=inf_interanual) %>% mutate(tipo="Observado")
+bind_rows(ia_h,
+  data.frame(fecha=meses_pron,yoy=ia1,tipo="M1 Directo"),
+  data.frame(fecha=meses_pron,yoy=ia2,tipo="M2 Logarítmico")) %>%
+  ggplot(aes(fecha,yoy,color=tipo,linetype=tipo)) +
+  geom_line(linewidth=0.9) + geom_point(size=1.2) +
+  geom_vline(xintercept=ultimo_mes+15,linetype="dotted",color="#7f8c8d") +
+  scale_color_manual(values=c(Observado="black",`M1 Directo`="#e74c3c",`M2 Logarítmico`="blue")) +
+  scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="solid")) +
+  labs(title="Inflación interanual — M1 vs M2",x=NULL,y="% interanual",color=NULL,linetype=NULL) +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
+
+---
+
+<center>
+*Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces.*
+*M1 = inflación mensual directa | M2 = log(IPC) con exp() para niveles.*
+</center>
