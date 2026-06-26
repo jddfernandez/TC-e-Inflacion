@@ -68,7 +68,7 @@ bd_mensual   <- ipc_analisis %>% left_join(tc_mensual %>% select(fecha,starts_wi
 
 inf_ts <- ts(ipc_analisis$inf_mensual, start=c(year(min(ipc_analisis$fecha)),month(min(ipc_analisis$fecha))), frequency=12)
 log_ipc_ts <- ts(ipc_log$log_IPC, start=c(year(min(ipc_log$fecha)),month(min(ipc_log$fecha))), frequency=12)
-dlog_ipc_ts <- diff(log_ipc_ts)
+dlog_ipc_ts <- diff(log_ipc_ts) * 100
 ```
 
 # Comportamiento de las Variables
@@ -351,19 +351,22 @@ data.frame(Mes=mn[month(meses_pron)],
 ipc_obs_df <- ipc %>% filter(year(fecha)>=ANIO_INICIO,!is.na(IPC)) %>% select(fecha,IPC)
 ci_fan <- data.frame(fecha=meses_pron,lo80=ip2_lo80,hi80=ip2_hi80,lo95=ip2_lo95,hi95=ip2_hi95)
 
+pto_enlace <- tail(ipc_obs_df, 1)
+m1_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), IPC=c(pto_enlace$IPC, ip1))
+m2_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), IPC=c(pto_enlace$IPC, ip2))
+
 ggplot() +
   geom_ribbon(data=ci_fan,aes(fecha,ymin=lo95,ymax=hi95),fill="#2980b9",alpha=0.10) +
   geom_ribbon(data=ci_fan,aes(fecha,ymin=lo80,ymax=hi80),fill="#2980b9",alpha=0.22) +
   geom_line(data=ipc_obs_df,aes(fecha,IPC),color="#2c3e50",linewidth=0.9) +
-  geom_line(data=data.frame(fecha=meses_pron,IPC=ip2),aes(fecha,IPC),color="blue",linewidth=0.9) +
-  geom_line(data=data.frame(fecha=meses_pron,IPC=ip1),aes(fecha,IPC),color="#e74c3c",linewidth=0.9,linetype="dashed") +
+  geom_line(data=m2_linea,aes(fecha,IPC),color="blue",linewidth=0.9) +
+  geom_line(data=m1_linea,aes(fecha,IPC),color="#e74c3c",linewidth=0.9,linetype="dashed") +
   geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),aes(fecha,IPC),color="blue",size=3) +
   geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),
             aes(fecha,IPC,label=round(IPC,1)),vjust=-1,color="blue",size=4.5) +
   geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),aes(fecha,IPC),color="#e74c3c",size=3) +
   geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),
             aes(fecha,IPC,label=round(IPC,1)),vjust=1.5,color="#e74c3c",size=4.5) +
-  geom_vline(xintercept=ultimo_mes+15,linetype="dotted",color="#7f8c8d") +
   labs(title="Fan Chart — M1 (rojo punteado) vs M2 (azul sólido, con IC)",
        subtitle=sprintf("M1: %s | M2: %s",mejor_m1$Modelo,mejor_m2$Modelo),x=NULL,y="IPC") +
   scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
@@ -374,13 +377,15 @@ ggplot() +
 
 ```{r yoy, fig.height=4.5}
 ia_h <- ipc %>% filter(!is.na(inf_interanual),year(fecha)>=ANIO_INICIO) %>%
-  select(fecha,yoy=inf_interanual) %>% mutate(tipo="Observado")
-bind_rows(ia_h,
-  data.frame(fecha=meses_pron,yoy=ia1,tipo="M1 Directo"),
-  data.frame(fecha=meses_pron,yoy=ia2,tipo="M2 Logarítmico")) %>%
+  select(fecha,yoy=inf_interanual)
+
+ult_ia <- tail(ia_h, 1)
+ia_m1_linea <- data.frame(fecha=c(ult_ia$fecha, meses_pron), yoy=c(ult_ia$yoy, ia1), tipo="M1 Directo")
+ia_m2_linea <- data.frame(fecha=c(ult_ia$fecha, meses_pron), yoy=c(ult_ia$yoy, ia2), tipo="M2 Logarítmico")
+
+bind_rows(ia_h %>% mutate(tipo="Observado"), ia_m1_linea, ia_m2_linea) %>%
   ggplot(aes(fecha,yoy,color=tipo,linetype=tipo)) +
   geom_line(linewidth=0.9) + geom_point(size=1.2) +
-  geom_vline(xintercept=ultimo_mes+15,linetype="dotted",color="#7f8c8d") +
   scale_color_manual(values=c(Observado="black",`M1 Directo`="#e74c3c",`M2 Logarítmico`="blue")) +
   scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="solid")) +
   labs(title="Inflación interanual — M1 vs M2",x=NULL,y="% interanual",color=NULL,linetype=NULL) +

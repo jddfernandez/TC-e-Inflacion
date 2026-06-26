@@ -332,38 +332,45 @@ for (i in 1:H_FORECAST)
 
 # ---- 11. Graficos finales ----
 
-## Fan chart M2
+## Fan chart — enlazando historico con proyeccion
 ipc_obs_df <- ipc %>% filter(year(fecha) >= ANIO_INICIO, !is.na(IPC)) %>%
   select(fecha, IPC)
 ci_fan <- data.frame(fecha = meses_pron,
                      lo80 = ipc_proy_m2_lo80, hi80 = ipc_proy_m2_hi80,
                      lo95 = ipc_proy_m2_lo95, hi95 = ipc_proy_m2_hi95)
 
+pto_enlace <- tail(ipc_obs_df, 1)
+m1_linea <- data.frame(fecha = c(pto_enlace$fecha, meses_pron),
+                       IPC   = c(pto_enlace$IPC,   ipc_proy_m1))
+m2_linea <- data.frame(fecha = c(pto_enlace$fecha, meses_pron),
+                       IPC   = c(pto_enlace$IPC,   ipc_proy_m2))
+
 print(ggplot() +
   geom_ribbon(data = ci_fan, aes(fecha, ymin=lo95, ymax=hi95), fill="#2980b9", alpha=0.10) +
   geom_ribbon(data = ci_fan, aes(fecha, ymin=lo80, ymax=hi80), fill="#2980b9", alpha=0.22) +
   geom_line(data = ipc_obs_df, aes(fecha, IPC), color="#2c3e50", linewidth=0.9) +
-  geom_line(data = data.frame(fecha=meses_pron, IPC=ipc_proy_m2),
-            aes(fecha, IPC), color="blue", linewidth=0.9) +
-  geom_line(data = data.frame(fecha=meses_pron, IPC=ipc_proy_m1),
-            aes(fecha, IPC), color="#e74c3c", linewidth=0.9, linetype="dashed") +
-  geom_vline(xintercept = ultimo_mes+15, linetype="dotted", color="#7f8c8d") +
+  geom_line(data = m2_linea, aes(fecha, IPC), color="blue", linewidth=0.9) +
+  geom_line(data = m1_linea, aes(fecha, IPC), color="#e74c3c", linewidth=0.9, linetype="dashed") +
   labs(title = "IPC proyectado — M1 (rojo) vs M2 (azul)",
        subtitle = sprintf("M1: %s | M2: %s", mejor_m1$Modelo, mejor_m2$Modelo),
        x = NULL, y = "IPC") +
   scale_x_date(date_breaks="4 months", date_labels="%b %Y") +
   theme(axis.text.x = element_text(angle=45, hjust=1)))
 
-## Inflacion interanual
+## Inflacion interanual — enlazando historico con proyeccion
 ia_h <- ipc %>% filter(!is.na(inf_interanual), year(fecha) >= ANIO_INICIO) %>%
-  select(fecha, yoy = inf_interanual) %>% mutate(tipo = "Observado")
-ia_all <- bind_rows(ia_h,
-  data.frame(fecha=meses_pron, yoy=ia_m1, tipo="M1 Directo"),
-  data.frame(fecha=meses_pron, yoy=ia_m2, tipo="M2 Logaritmico"))
+  select(fecha, yoy = inf_interanual)
+
+ult_ia <- tail(ia_h, 1)
+ia_m1_linea <- data.frame(fecha = c(ult_ia$fecha, meses_pron),
+                          yoy   = c(ult_ia$yoy,   ia_m1), tipo = "M1 Directo")
+ia_m2_linea <- data.frame(fecha = c(ult_ia$fecha, meses_pron),
+                          yoy   = c(ult_ia$yoy,   ia_m2), tipo = "M2 Logaritmico")
+
+ia_all <- bind_rows(ia_h %>% mutate(tipo = "Observado"), ia_m1_linea, ia_m2_linea)
 
 print(ggplot(ia_all, aes(fecha, yoy, color=tipo, linetype=tipo)) +
   geom_line(linewidth=0.9) + geom_point(size=1.2) +
-  geom_vline(xintercept=ultimo_mes+15, linetype="dotted", color="#7f8c8d") +
   scale_color_manual(values=c(Observado="black", `M1 Directo`="#e74c3c", `M2 Logaritmico`="blue")) +
   scale_linetype_manual(values=c(Observado="solid", `M1 Directo`="dashed", `M2 Logaritmico`="solid")) +
   labs(title="Inflacion interanual — M1 vs M2", x=NULL, y="% interanual", color=NULL, linetype=NULL) +
@@ -407,14 +414,41 @@ hoja_comp <- data.frame(
                      round(mejor_m2$RMSE,6), round(mejor_m2$MAPE,4),
                      round(rmse_m2,4), paste0(round(mape_m2,2),"%")))
 
+## Serie completa: historico + proyectado
+hoja_serie <- bind_rows(
+  ipc %>%
+    filter(year(fecha) >= ANIO_INICIO, !is.na(IPC)) %>%
+    transmute(Anio = Año, Mes = Mes, IPC = round(IPC, 4),
+              M1_IPC = round(IPC, 4), M2_IPC = round(IPC, 4),
+              Inf_interanual = round(inf_interanual, 2),
+              Tipo = "HISTORICO"),
+  data.frame(
+    Anio = year(meses_pron), Mes = mn[month(meses_pron)],
+    IPC = NA,
+    M1_IPC = round(ipc_proy_m1, 4), M2_IPC = round(ipc_proy_m2, 4),
+    Inf_interanual = NA,
+    Tipo = "PROYECCION")
+) %>%
+  mutate(
+    M1_Inf_ia = round(ia_m1[match(paste(Anio, Mes), paste(year(meses_pron), mn[month(meses_pron)]))], 2),
+    M2_Inf_ia = round(ia_m2[match(paste(Anio, Mes), paste(year(meses_pron), mn[month(meses_pron)]))], 2)
+  ) %>%
+  mutate(
+    M1_Inf_ia = ifelse(Tipo == "HISTORICO", Inf_interanual, M1_Inf_ia),
+    M2_Inf_ia = ifelse(Tipo == "HISTORICO", Inf_interanual, M2_Inf_ia)
+  ) %>%
+  select(Anio, Mes, IPC, M1_IPC, M2_IPC, M1_Inf_ia, M2_Inf_ia, Tipo)
+
 wb <- createWorkbook()
-addWorksheet(wb,"Proyecciones");  writeData(wb,"Proyecciones", hoja_proy)
-addWorksheet(wb,"Backtesting");   writeData(wb,"Backtesting",  hoja_bt)
-addWorksheet(wb,"Scoring_M1");    writeData(wb,"Scoring_M1",   hoja_scoring_m1)
-addWorksheet(wb,"Scoring_M2");    writeData(wb,"Scoring_M2",   hoja_scoring_m2)
-addWorksheet(wb,"Comparacion");   writeData(wb,"Comparacion",  hoja_comp)
+addWorksheet(wb,"Serie_Completa"); writeData(wb,"Serie_Completa", hoja_serie)
+addWorksheet(wb,"Proyecciones");   writeData(wb,"Proyecciones",   hoja_proy)
+addWorksheet(wb,"Backtesting");    writeData(wb,"Backtesting",    hoja_bt)
+addWorksheet(wb,"Scoring_M1");     writeData(wb,"Scoring_M1",     hoja_scoring_m1)
+addWorksheet(wb,"Scoring_M2");     writeData(wb,"Scoring_M2",     hoja_scoring_m2)
+addWorksheet(wb,"Comparacion");    writeData(wb,"Comparacion",    hoja_comp)
 saveWorkbook(wb, RUTA_OUTPUT, overwrite = TRUE)
 cat(sprintf("Exportado: %s\n", RUTA_OUTPUT))
+cat("  Hoja 'Serie_Completa': historico + proyectado (M1 y M2)\n")
 
 # ---- 13. Resumen ----
 
