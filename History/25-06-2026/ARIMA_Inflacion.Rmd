@@ -68,7 +68,7 @@ bd_mensual   <- ipc_analisis %>% left_join(tc_mensual %>% select(fecha,starts_wi
 
 inf_ts <- ts(ipc_analisis$inf_mensual, start=c(year(min(ipc_analisis$fecha)),month(min(ipc_analisis$fecha))), frequency=12)
 log_ipc_ts <- ts(ipc_log$log_IPC, start=c(year(min(ipc_log$fecha)),month(min(ipc_log$fecha))), frequency=12)
-dlog_ipc_ts <- diff(log_ipc_ts)
+dlog_ipc_ts <- diff(log_ipc_ts) * 100
 ```
 
 # Comportamiento de las Variables
@@ -118,13 +118,8 @@ adf_dlog <- adf.test(dlog_ipc_ts); pp_dlog <- pp.test(dlog_ipc_ts); kpss_dlog <-
 
 ```{r tabla-raiz}
 cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
-
 data.frame(
-  Prueba=rep(c("ADF","Phillips-Perron","KPSS"),3),
-  H0=rep(c("Raíz unitaria (no estacionaria)","Raíz unitaria (no estacionaria)",
-            "Serie estacionaria"), 3),
-  Rechazo=rep(c("p < 0.05 → Estacionaria","p < 0.05 → Estacionaria",
-                 "p < 0.05 → No estacionaria"), 3),
+  Prueba=rep(c("ADF","PP","KPSS"),3),
   Serie=c(rep("Inf. mensual (M1)",3),rep("log(IPC) (M2)",3),rep("Δlog(IPC)",3)),
   Stat=round(c(adf_inf$stat,pp_inf$stat,kpss_inf$stat,adf_log$stat,pp_log$stat,kpss_log$stat,
                adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat),4),
@@ -134,9 +129,9 @@ data.frame(
                cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),
                cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"))
 ) %>%
-  kable(col.names=c("Prueba","H₀","Criterio de rechazo","Serie","Estadístico","p-valor","Conclusión"),
-        caption="Pruebas de raíz unitaria — con hipótesis nulas",align=c("l","l","l","l","r","r","l")) %>%
-  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE, font_size=11) %>%
+  kable(col.names=c("Prueba","Serie","Estadístico","p-valor","Conclusión"),
+        caption="Pruebas de raíz unitaria",align=c("l","l","r","r","l")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
   pack_rows("M1: Inflación mensual",1,3) %>% pack_rows("M2: log(IPC)",4,6) %>% pack_rows("Δlog(IPC)",7,9)
 ```
 
@@ -181,13 +176,9 @@ estimar_grilla <- function(serie, max_p=MAX_P, max_q=MAX_Q) {
 
 results_m1 <- estimar_grilla(inf_ts)
 results_m2 <- estimar_grilla(log_ipc_ts)
-mejor_m1_propio <- results_m1[1,]
-mejor_m2 <- results_m2[1,]
-
-## M1 se FUERZA a usar el mismo orden que M2
-modelo_m2 <- Arima(log_ipc_ts, order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML")
-modelo_m1 <- Arima(inf_ts,     order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML")
-orden_comun <- sprintf("ARIMA(%d,%d,%d)", mejor_m2$p, mejor_m2$d, mejor_m2$q)
+mejor_m1 <- results_m1[1,]; mejor_m2 <- results_m2[1,]
+modelo_m1 <- Arima(inf_ts,order=c(mejor_m1$p,mejor_m1$d,mejor_m1$q),method="ML")
+modelo_m2 <- Arima(log_ipc_ts,order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
 ```
 
 El scoring compuesto integra: **RMSE** + **MAPE** + promedio(**AICc**, **BIC**, **Hannan-Quinn**) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
@@ -205,8 +196,6 @@ results_m1 %>% head(15) %>%
   row_spec(1,bold=TRUE,color="white",background="#e74c3c") %>% column_spec(10,bold=TRUE)
 ```
 
-> M1 elegiría **`r mejor_m1_propio$Modelo`** por score propio, pero se **fuerza a usar `r orden_comun`** (ganador de M2) para comparabilidad.
-
 ## M2: Método Logarítmico (log IPC)
 
 ```{r tabla-m2}
@@ -220,39 +209,30 @@ results_m2 %>% head(15) %>%
   row_spec(1,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
 ```
 
-## Comparación (especificación común: `r orden_comun`)
+## Comparación de ganadores
 
 ```{r comparacion-ganadores}
-acc_m1 <- accuracy(modelo_m1); acc_m2 <- accuracy(modelo_m2)
-lb12_m1 <- Box.test(residuals(modelo_m1),lag=12,type="Ljung-Box",fitdf=length(coef(modelo_m1)))$p.value
-lb12_m2 <- Box.test(residuals(modelo_m2),lag=12,type="Ljung-Box",fitdf=length(coef(modelo_m2)))$p.value
-
 data.frame(
-  Criterio=c("Especificación forzada","AIC","BIC","AICc","Hannan-Quinn",
-             "RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
-  M1=c(orden_comun, round(AIC(modelo_m1),2), round(BIC(modelo_m1),2),
-       round(modelo_m1$aicc,2),
-       round(-2*as.numeric(logLik(modelo_m1))+2*attr(logLik(modelo_m1),"df")*log(log(modelo_m1$nobs)),2),
-       round(acc_m1[1,"RMSE"],6), round(acc_m1[1,"MAPE"],4), round(lb12_m1,4)),
-  M2=c(orden_comun, round(AIC(modelo_m2),2), round(BIC(modelo_m2),2),
-       round(modelo_m2$aicc,2),
-       round(-2*as.numeric(logLik(modelo_m2))+2*attr(logLik(modelo_m2),"df")*log(log(modelo_m2$nobs)),2),
-       round(acc_m2[1,"RMSE"],6), round(acc_m2[1,"MAPE"],4), round(lb12_m2,4))
+  Criterio=c("Modelo ganador","Score compuesto","AICc","BIC","Hannan-Quinn","RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
+  M1=c(mejor_m1$Modelo, round(mejor_m1$Score,3), round(mejor_m1$AICc,2), round(mejor_m1$BIC,2),
+       round(mejor_m1$HQ,2), round(mejor_m1$RMSE,6), round(mejor_m1$MAPE,4), round(mejor_m1$LB12,4)),
+  M2=c(mejor_m2$Modelo, round(mejor_m2$Score,3), round(mejor_m2$AICc,2), round(mejor_m2$BIC,2),
+       round(mejor_m2$HQ,2), round(mejor_m2$RMSE,6), round(mejor_m2$MAPE,4), round(mejor_m2$LB12,4))
 ) %>%
   kable(col.names=c("Criterio","M1: Directo","M2: Logarítmico"),
-        caption=sprintf("Comparación con especificación común %s",orden_comun),align=c("l","r","r")) %>%
+        caption="Comparación de modelos ganadores",align=c("l","r","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
 ```{r diagnostico-graficos, fig.height=8}
 par(mfrow=c(2,4),mar=c(4,3,3,1))
 r1<-residuals(modelo_m1); r2<-residuals(modelo_m2)
-plot(r1,main=paste("M1:",orden_comun),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
+plot(r1,main=paste("M1:",mejor_m1$Modelo),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
 hist(r1,breaks=12,prob=TRUE,main="M1: Histograma",col="#e74c3c40",border="white",xlab="")
 curve(dnorm(x,mean(r1),sd(r1)),add=TRUE,col="#e74c3c",lwd=2)
 Acf(r1,main="M1: ACF residuos",lag.max=18)
 qqnorm(r1,main="M1: Q-Q",col="#e74c3c",pch=16); qqline(r1,col="grey50",lwd=2)
-plot(r2,main=paste("M2:",orden_comun),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
+plot(r2,main=paste("M2:",mejor_m2$Modelo),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
 hist(r2,breaks=12,prob=TRUE,main="M2: Histograma",col="#2980b940",border="white",xlab="")
 curve(dnorm(x,mean(r2),sd(r2)),add=TRUE,col="#2980b9",lwd=2)
 Acf(r2,main="M2: ACF residuos",lag.max=18)
@@ -264,63 +244,68 @@ par(mfrow=c(1,1))
 
 # Backtesting
 
-Se reservan los últimos `r H_BACKTEST` meses. Ambos métodos usan **`r orden_comun`** y se comparan en **inflación mensual**.
+Se reservan los últimos `r H_BACKTEST` meses. Ambos modelos se comparan en **niveles de IPC**.
 
 ```{r backtesting}
 ultimo_mes <- max(ipc_analisis$fecha)
 meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FORECAST)
 fechas_test <- tail(ipc_analisis$fecha, H_BACKTEST)
 
+## M1
 n1<-length(inf_ts); nt1<-n1-H_BACKTEST
-bt1<-Arima(window(inf_ts,end=time(inf_ts)[nt1]),order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
+bt1<-Arima(window(inf_ts,end=time(inf_ts)[nt1]),order=c(mejor_m1$p,mejor_m1$d,mejor_m1$q),method="ML")
 fc1<-forecast(bt1,h=H_BACKTEST,level=c(80,95))
-fc_inf_m1 <- as.numeric(fc1$mean)
-obs_inf   <- tail(ipc_analisis$inf_mensual, H_BACKTEST)
+ult_ipc_tr <- ipc_analisis$IPC[nt1]
+fc_inf1<-as.numeric(fc1$mean); ipc_fc1<-numeric(H_BACKTEST)
+ipc_fc1[1]<-ult_ipc_tr*(1+fc_inf1[1]/100)
+for(i in 2:H_BACKTEST) ipc_fc1[i]<-ipc_fc1[i-1]*(1+fc_inf1[i]/100)
 
+## M2
 n2<-length(log_ipc_ts); nt2<-n2-H_BACKTEST
 bt2<-Arima(window(log_ipc_ts,end=time(log_ipc_ts)[nt2]),order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
 fc2<-forecast(bt2,h=H_BACKTEST,level=c(80,95))
-ipc_fc2 <- exp(as.numeric(fc2$mean))
-ipc_obs <- tail(ipc_analisis$IPC, H_BACKTEST)
-ipc_pre <- c(ipc_analisis$IPC[nt1], head(ipc_fc2, -1))
-fc_inf_m2 <- (ipc_fc2 / ipc_pre - 1) * 100
+ipc_fc2<-exp(as.numeric(fc2$mean))
 
-err1 <- fc_inf_m1 - obs_inf; err2 <- fc_inf_m2 - obs_inf
+ipc_obs <- tail(ipc_analisis$IPC, H_BACKTEST)
+err1<-ipc_fc1-ipc_obs; err2<-ipc_fc2-ipc_obs
 rmse1<-sqrt(mean(err1^2)); rmse2<-sqrt(mean(err2^2))
-mae1<-mean(abs(err1)); mae2<-mean(abs(err2))
+mape1<-mean(abs(err1/ipc_obs))*100; mape2<-mean(abs(err2/ipc_obs))*100
+lo95_2<-exp(as.numeric(fc2$lower[,2])); hi95_2<-exp(as.numeric(fc2$upper[,2]))
+dentro2<-ipc_obs>=lo95_2 & ipc_obs<=hi95_2
 ```
 
 ```{r tabla-bt}
-data.frame(Fecha=format(fechas_test,"%b %Y"), Observado=round(obs_inf,4),
-           M1_pron=round(fc_inf_m1,4), M1_err=round(err1,4),
-           M2_pron=round(fc_inf_m2,4), M2_err=round(err2,4)) %>%
-  kable(col.names=c("Fecha","Obs. (%)","M1 pron. (%)","M1 error","M2 pron. (%)","M2 error"),
-        caption="Backtesting — Inflación mensual observada vs. pronosticada",align=c("l",rep("r",5))) %>%
+data.frame(Fecha=format(fechas_test,"%b %Y"), IPC_obs=round(ipc_obs,2),
+           M1_pron=round(ipc_fc1,2), M1_err=round(err1,2),
+           M2_pron=round(ipc_fc2,2), M2_err=round(err2,2)) %>%
+  kable(col.names=c("Fecha","IPC obs.","M1 pronóst.","M1 error","M2 pronóst.","M2 error"),
+        caption="Backtesting — IPC observado vs. pronosticado (ambos métodos)",align=c("l",rep("r",5))) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
 ```{r metricas-bt}
-data.frame(Metrica=c("RMSE (pp)","MAE (pp)"),
-           M1=c(round(rmse1,4), round(mae1,4)),
-           M2=c(round(rmse2,4), round(mae2,4))) %>%
+data.frame(Metrica=c("RMSE (IPC)","MAPE (IPC)"),
+           M1=c(round(rmse1,4), paste0(round(mape1,2),"%")),
+           M2=c(round(rmse2,4), paste0(round(mape2,2),"%"))) %>%
   kable(col.names=c("Métrica","M1: Directo","M2: Logarítmico"),
-        caption="Métricas de backtesting — inflación mensual",align=c("l","r","r")) %>%
+        caption="Métricas de backtesting comparadas",align=c("l","r","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
 ```{r grafico-bt, fig.height=5}
 bt_df <- bind_rows(
-  data.frame(fecha=fechas_test, inf=obs_inf, tipo="Observado"),
-  data.frame(fecha=fechas_test, inf=fc_inf_m1, tipo="M1 Directo"),
-  data.frame(fecha=fechas_test, inf=fc_inf_m2, tipo="M2 Logarítmico"))
+  data.frame(fecha=fechas_test, IPC=ipc_obs, tipo="Observado"),
+  data.frame(fecha=fechas_test, IPC=ipc_fc1, tipo="M1 Directo"),
+  data.frame(fecha=fechas_test, IPC=ipc_fc2, tipo="M2 Logarítmico"))
+cols_bt <- c(Observado="#2c3e50",`M1 Directo`="#e74c3c",`M2 Logarítmico`="#2980b9")
 
-ggplot(bt_df, aes(fecha,inf,color=tipo,linetype=tipo)) +
+ggplot(bt_df, aes(fecha,IPC,color=tipo,linetype=tipo)) +
   geom_line(linewidth=0.9) + geom_point(size=2.5) +
-  scale_color_manual(values=c(Observado="#2c3e50",`M1 Directo`="#e74c3c",`M2 Logarítmico`="#2980b9")) +
+  scale_color_manual(values=cols_bt) +
   scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="dashed")) +
-  labs(title=sprintf("Backtesting inflación mensual — %s",orden_comun),
-       subtitle=sprintf("M1 RMSE=%.4f pp | M2 RMSE=%.4f pp",rmse1,rmse2),
-       x=NULL,y="Inflación mensual (%)",color=NULL,linetype=NULL) +
+  labs(title="Backtesting IPC — M1 vs M2",
+       subtitle=sprintf("M1 MAPE=%.2f%% | M2 MAPE=%.2f%%",mape1,mape2),
+       x=NULL,y="IPC",color=NULL,linetype=NULL) +
   scale_x_date(date_breaks="1 month",date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
@@ -331,137 +316,86 @@ ggplot(bt_df, aes(fecha,inf,color=tipo,linetype=tipo)) +
 
 ```{r pronostico}
 fc_f1<-forecast(modelo_m1,h=H_FORECAST,level=c(80,95))
-inf_mens_m1 <- as.numeric(fc_f1$mean)
-ult_ipc<-tail(ipc_analisis$IPC,1)
-ip1<-numeric(H_FORECAST); ip1[1]<-ult_ipc*(1+inf_mens_m1[1]/100)
-for(i in 2:H_FORECAST) ip1[i]<-ip1[i-1]*(1+inf_mens_m1[i]/100)
+ult_ipc<-tail(ipc_analisis$IPC,1); fi1<-as.numeric(fc_f1$mean); ip1<-numeric(H_FORECAST)
+ip1[1]<-ult_ipc*(1+fi1[1]/100); for(i in 2:H_FORECAST) ip1[i]<-ip1[i-1]*(1+fi1[i]/100)
 
 fc_f2<-forecast(modelo_m2,h=H_FORECAST,level=c(80,95))
 ip2<-exp(as.numeric(fc_f2$mean))
-inf_mens_m2 <- numeric(H_FORECAST)
-inf_mens_m2[1] <- (ip2[1]/ult_ipc - 1)*100
-for(i in 2:H_FORECAST) inf_mens_m2[i] <- (ip2[i]/ip2[i-1] - 1)*100
+ip2_lo80<-exp(as.numeric(fc_f2$lower[,1])); ip2_hi80<-exp(as.numeric(fc_f2$upper[,1]))
+ip2_lo95<-exp(as.numeric(fc_f2$lower[,2])); ip2_hi95<-exp(as.numeric(fc_f2$upper[,2]))
 
 ipc_h<-ipc$IPC[!is.na(ipc$IPC)]; fh<-ipc$fecha[!is.na(ipc$IPC)]
 der_ia <- function(ipv) {
   ic<-c(ipc_h,ipv); fc<-c(fh,meses_pron)
   sapply(seq_along(meses_pron),function(i)(ipv[i]/ic[which.min(abs(fc-(meses_pron[i]%m-%months(12))))]-1)*100)
 }
-ia_m1<-der_ia(ip1); ia_m2<-der_ia(ip2)
+ia1<-der_ia(ip1); ia2<-der_ia(ip2)
 ```
 
-## Proyección comparada — Inflación
+## Proyección comparada
 
 ```{r tabla-proy}
 mn<-c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre")
 data.frame(Mes=mn[month(meses_pron)],
-           M1_mens=round(inf_mens_m1,4), M1_ia=round(ia_m1,2),
-           M2_mens=round(inf_mens_m2,4), M2_ia=round(ia_m2,2)) %>%
-  kable(col.names=c("Mes","M1 mensual (%)","M1 interanual (%)","M2 mensual (%)","M2 interanual (%)"),
-        caption=sprintf("Proyección de inflación — %s forzado en ambos métodos",orden_comun),
-        align=c("l",rep("r",4))) %>%
+           M1_IPC=round(ip1,2), M1_ia=round(ia1,2),
+           M2_IPC=round(ip2,2), M2_ia=round(ia2,2),
+           M2_lo95=round(ip2_lo95,2), M2_hi95=round(ip2_hi95,2)) %>%
+  kable(col.names=c("Mes","M1 IPC","M1 Inf.ia(%)","M2 IPC","M2 Inf.ia(%)","M2 IC95 inf","M2 IC95 sup"),
+        caption="Proyección IPC e inflación interanual — M1 vs M2",align=c("l",rep("r",6))) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
-## Inflación interanual — M1 vs M2
+## Fan Chart comparado
 
-```{r yoy, fig.height=5}
+```{r fan-chart, fig.height=5.5}
+ipc_obs_df <- ipc %>% filter(year(fecha)>=ANIO_INICIO,!is.na(IPC)) %>% select(fecha,IPC)
+ci_fan <- data.frame(fecha=meses_pron,lo80=ip2_lo80,hi80=ip2_hi80,lo95=ip2_lo95,hi95=ip2_hi95)
+
+pto_enlace <- tail(ipc_obs_df, 1)
+m1_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), IPC=c(pto_enlace$IPC, ip1))
+m2_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), IPC=c(pto_enlace$IPC, ip2))
+
+ggplot() +
+  geom_ribbon(data=ci_fan,aes(fecha,ymin=lo95,ymax=hi95),fill="#2980b9",alpha=0.10) +
+  geom_ribbon(data=ci_fan,aes(fecha,ymin=lo80,ymax=hi80),fill="#2980b9",alpha=0.22) +
+  geom_line(data=ipc_obs_df,aes(fecha,IPC),color="#2c3e50",linewidth=0.9) +
+  geom_line(data=m2_linea,aes(fecha,IPC),color="blue",linewidth=0.9) +
+  geom_line(data=m1_linea,aes(fecha,IPC),color="#e74c3c",linewidth=0.9,linetype="dashed") +
+  geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),aes(fecha,IPC),color="blue",size=3) +
+  geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip2,1)),
+            aes(fecha,IPC,label=round(IPC,1)),vjust=-1,color="blue",size=4.5) +
+  geom_point(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),aes(fecha,IPC),color="#e74c3c",size=3) +
+  geom_text(data=data.frame(fecha=tail(meses_pron,1),IPC=tail(ip1,1)),
+            aes(fecha,IPC,label=round(IPC,1)),vjust=1.5,color="#e74c3c",size=4.5) +
+  labs(title="Fan Chart — M1 (rojo punteado) vs M2 (azul sólido, con IC)",
+       subtitle=sprintf("M1: %s | M2: %s",mejor_m1$Modelo,mejor_m2$Modelo),x=NULL,y="IPC") +
+  scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+## Inflación interanual observada y proyectada
+
+```{r yoy, fig.height=4.5}
 ia_h <- ipc %>% filter(!is.na(inf_interanual),year(fecha)>=ANIO_INICIO) %>%
   select(fecha,yoy=inf_interanual)
-ult_ia <- tail(ia_h, 1)
-ia_m1_l <- data.frame(fecha=c(ult_ia$fecha,meses_pron), yoy=c(ult_ia$yoy,ia_m1), tipo="M1 Directo")
-ia_m2_l <- data.frame(fecha=c(ult_ia$fecha,meses_pron), yoy=c(ult_ia$yoy,ia_m2), tipo="M2 Logarítmico")
 
-bind_rows(ia_h %>% mutate(tipo="Observado"), ia_m1_l, ia_m2_l) %>%
+ult_ia <- tail(ia_h, 1)
+ia_m1_linea <- data.frame(fecha=c(ult_ia$fecha, meses_pron), yoy=c(ult_ia$yoy, ia1), tipo="M1 Directo")
+ia_m2_linea <- data.frame(fecha=c(ult_ia$fecha, meses_pron), yoy=c(ult_ia$yoy, ia2), tipo="M2 Logarítmico")
+
+bind_rows(ia_h %>% mutate(tipo="Observado"), ia_m1_linea, ia_m2_linea) %>%
   ggplot(aes(fecha,yoy,color=tipo,linetype=tipo)) +
   geom_line(linewidth=0.9) + geom_point(size=1.2) +
   scale_color_manual(values=c(Observado="black",`M1 Directo`="#e74c3c",`M2 Logarítmico`="blue")) +
   scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="solid")) +
-  labs(title=sprintf("Inflación interanual — %s",orden_comun),x=NULL,y="% interanual",color=NULL,linetype=NULL) +
+  labs(title="Inflación interanual — M1 vs M2",x=NULL,y="% interanual",color=NULL,linetype=NULL) +
   scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
 
 ---
 
-# Escenario Contrafactual vs. Post-Bloqueos
-
-La proyección ARIMA (M2) captura la dinámica tendencial de la inflación **sin disrupciones**. Se compara contra el escenario que incorpora el efecto de los bloqueos de mayo 2025.
-
-```{r contrafactual}
-esc_postbloq <- data.frame(
-  fecha = as.Date(c("2026-07-01","2026-08-01","2026-09-01",
-                     "2026-10-01","2026-11-01","2026-12-01")),
-  ia_postbloq = c(12.69994503, 13.39646203, 14.62735650,
-                   15.38052115, 16.28583617, 16.90125995)
-)
-
-m2_jul_dic <- data.frame(
-  fecha = meses_pron[meses_pron >= as.Date("2026-07-01")],
-  ia_contra = ia_m2[meses_pron >= as.Date("2026-07-01")],
-  mens_contra = inf_mens_m2[meses_pron >= as.Date("2026-07-01")]
-)
-
-tabla_cf <- m2_jul_dic %>%
-  left_join(esc_postbloq, by="fecha") %>%
-  mutate(diferencia = ia_postbloq - ia_contra)
-```
-
-```{r tabla-contrafactual}
-tabla_cf %>%
-  transmute(
-    Mes = mn[month(fecha)],
-    `M2 mensual (%)` = round(mens_contra, 4),
-    `M2 interanual (%) — Contrafactual` = round(ia_contra, 2),
-    `Interanual (%) — Post-bloqueos` = round(ia_postbloq, 2),
-    `Diferencia (pp)` = round(diferencia, 2)
-  ) %>%
-  kable(caption="Contrafactual ARIMA (M2) vs. escenario post-bloqueos — Inflación interanual",
-        align=c("l",rep("r",4))) %>%
-  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
-  column_spec(5, bold=TRUE, color="#e74c3c")
-```
-
-```{r grafico-contrafactual, fig.height=5.5}
-ia_h2 <- ipc %>% filter(!is.na(inf_interanual), year(fecha) >= ANIO_INICIO) %>%
-  select(fecha, yoy = inf_interanual)
-ult_ia2 <- tail(ia_h2, 1)
-
-cf_lineas <- bind_rows(
-  ia_h2 %>% mutate(tipo = "Observado"),
-  data.frame(fecha=c(ult_ia2$fecha, m2_jul_dic$fecha),
-             yoy=c(ult_ia2$yoy, m2_jul_dic$ia_contra),
-             tipo="Contrafactual ARIMA (M2)"),
-  data.frame(fecha=c(ult_ia2$fecha, esc_postbloq$fecha),
-             yoy=c(ult_ia2$yoy, esc_postbloq$ia_postbloq),
-             tipo="Post-bloqueos")
-)
-
-ggplot(cf_lineas, aes(fecha, yoy, color=tipo, linetype=tipo)) +
-  geom_line(linewidth=1) + geom_point(size=1.5) +
-  geom_ribbon(data=data.frame(fecha=esc_postbloq$fecha,
-    lo=m2_jul_dic$ia_contra, hi=esc_postbloq$ia_postbloq),
-    aes(fecha, ymin=lo, ymax=hi), inherit.aes=FALSE,
-    fill="#e74c3c", alpha=0.15) +
-  scale_color_manual(values=c(Observado="black",
-    `Contrafactual ARIMA (M2)`="blue", `Post-bloqueos`="#e74c3c")) +
-  scale_linetype_manual(values=c(Observado="solid",
-    `Contrafactual ARIMA (M2)`="solid", `Post-bloqueos`="dashed")) +
-  annotate("text", x=as.Date("2026-10-01"), y=mean(c(tail(m2_jul_dic$ia_contra,1),
-    tail(esc_postbloq$ia_postbloq,1))), label="Efecto\nbloqueos\n+ shocks",
-    color="#e74c3c", size=3.5, fontface="italic") +
-  labs(title="Inflación interanual — Contrafactual vs. Post-bloqueos",
-       subtitle=sprintf("Diferencia a dic 2026: %.1f pp", tail(tabla_cf$diferencia,1)),
-       x=NULL, y="% interanual", color=NULL, linetype=NULL) +
-  scale_x_date(date_breaks="4 months", date_labels="%b %Y") +
-  theme(axis.text.x=element_text(angle=45,hjust=1))
-```
-
-> A diciembre 2026, el escenario post-bloqueos proyecta una inflación interanual de **`r round(tail(esc_postbloq$ia_postbloq,1),1)`%**, mientras que el contrafactual ARIMA (M2) estima **`r round(tail(m2_jul_dic$ia_contra,1),1)`%** — una diferencia de **`r round(tail(tabla_cf$diferencia,1),1)` puntos porcentuales** atribuible al efecto de los bloqueos de mayo 2025.
-
----
-
 <center>
 *Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces.*
-*Especificación común `r orden_comun` forzada en ambos métodos para comparabilidad.*
+*M1 = inflación mensual directa | M2 = log(IPC) con exp() para niveles.*
 </center>
