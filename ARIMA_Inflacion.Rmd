@@ -184,10 +184,13 @@ results_m2 <- estimar_grilla(log_ipc_ts)
 mejor_m1_propio <- results_m1[1,]
 mejor_m2 <- results_m2[1,]
 
-## M1 se FUERZA a usar el mismo orden que M2
+## M1 se FUERZA a usar p y q de M2, pero con d=0
+## (la inflacion mensual ya ES la primera diferencia del IPC;
+##  usar d=1 encima sobrediferencia)
 modelo_m2 <- Arima(log_ipc_ts, order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML")
-modelo_m1 <- Arima(inf_ts,     order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML")
-orden_comun <- sprintf("ARIMA(%d,%d,%d)", mejor_m2$p, mejor_m2$d, mejor_m2$q)
+modelo_m1 <- Arima(inf_ts,     order=c(mejor_m2$p, 0,          mejor_m2$q), method="ML")
+orden_m2  <- sprintf("ARIMA(%d,%d,%d)", mejor_m2$p, mejor_m2$d, mejor_m2$q)
+orden_m1  <- sprintf("ARIMA(%d,0,%d)",  mejor_m2$p, mejor_m2$q)
 ```
 
 El scoring compuesto integra: **RMSE** + **MAPE** + promedio(**AICc**, **BIC**, **Hannan-Quinn**) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
@@ -205,7 +208,7 @@ results_m1 %>% head(15) %>%
   row_spec(1,bold=TRUE,color="white",background="#e74c3c") %>% column_spec(10,bold=TRUE)
 ```
 
-> M1 elegiría **`r mejor_m1_propio$Modelo`** por score propio, pero se **fuerza a usar `r orden_comun`** (ganador de M2) para comparabilidad.
+> M1 elegiría **`r mejor_m1_propio$Modelo`** por score propio, pero se fuerza a **`r orden_m1`** (mismo AR/MA que M2, con d=0 porque la inflación mensual ya es una primera diferencia del IPC).
 
 ## M2: Método Logarítmico (log IPC)
 
@@ -220,7 +223,7 @@ results_m2 %>% head(15) %>%
   row_spec(1,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
 ```
 
-## Comparación (especificación común: `r orden_comun`)
+## Comparación (M1: `r orden_m1` vs M2: `r orden_m2`)
 
 ```{r comparacion-ganadores}
 acc_m1 <- accuracy(modelo_m1); acc_m2 <- accuracy(modelo_m2)
@@ -230,29 +233,30 @@ lb12_m2 <- Box.test(residuals(modelo_m2),lag=12,type="Ljung-Box",fitdf=length(co
 data.frame(
   Criterio=c("Especificación forzada","AIC","BIC","AICc","Hannan-Quinn",
              "RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
-  M1=c(orden_comun, round(AIC(modelo_m1),2), round(BIC(modelo_m1),2),
+  M1=c(orden_m1, round(AIC(modelo_m1),2), round(BIC(modelo_m1),2),
        round(modelo_m1$aicc,2),
        round(-2*as.numeric(logLik(modelo_m1))+2*attr(logLik(modelo_m1),"df")*log(log(modelo_m1$nobs)),2),
        round(acc_m1[1,"RMSE"],6), round(acc_m1[1,"MAPE"],4), round(lb12_m1,4)),
-  M2=c(orden_comun, round(AIC(modelo_m2),2), round(BIC(modelo_m2),2),
+  M2=c(orden_m2, round(AIC(modelo_m2),2), round(BIC(modelo_m2),2),
        round(modelo_m2$aicc,2),
        round(-2*as.numeric(logLik(modelo_m2))+2*attr(logLik(modelo_m2),"df")*log(log(modelo_m2$nobs)),2),
        round(acc_m2[1,"RMSE"],6), round(acc_m2[1,"MAPE"],4), round(lb12_m2,4))
 ) %>%
   kable(col.names=c("Criterio","M1: Directo","M2: Logarítmico"),
-        caption=sprintf("Comparación con especificación común %s",orden_comun),align=c("l","r","r")) %>%
+        caption=sprintf("M1: %s sobre inf. mensual vs M2: %s sobre log(IPC)", orden_m1, orden_m2),
+        align=c("l","r","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
 
 ```{r diagnostico-graficos, fig.height=8}
 par(mfrow=c(2,4),mar=c(4,3,3,1))
 r1<-residuals(modelo_m1); r2<-residuals(modelo_m2)
-plot(r1,main=paste("M1:",orden_comun),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
+plot(r1,main=paste("M1:",orden_m1),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
 hist(r1,breaks=12,prob=TRUE,main="M1: Histograma",col="#e74c3c40",border="white",xlab="")
 curve(dnorm(x,mean(r1),sd(r1)),add=TRUE,col="#e74c3c",lwd=2)
 Acf(r1,main="M1: ACF residuos",lag.max=18)
 qqnorm(r1,main="M1: Q-Q",col="#e74c3c",pch=16); qqline(r1,col="grey50",lwd=2)
-plot(r2,main=paste("M2:",orden_comun),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
+plot(r2,main=paste("M2:",orden_m2),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
 hist(r2,breaks=12,prob=TRUE,main="M2: Histograma",col="#2980b940",border="white",xlab="")
 curve(dnorm(x,mean(r2),sd(r2)),add=TRUE,col="#2980b9",lwd=2)
 Acf(r2,main="M2: ACF residuos",lag.max=18)
@@ -264,7 +268,7 @@ par(mfrow=c(1,1))
 
 # Backtesting
 
-Se reservan los últimos `r H_BACKTEST` meses. Ambos métodos usan **`r orden_comun`** y se comparan en **inflación mensual**.
+Se reservan los últimos `r H_BACKTEST` meses. M1 usa **`r orden_m1`** y M2 usa **`r orden_m2`**. Se comparan en **inflación mensual**.
 
 ```{r backtesting}
 ultimo_mes <- max(ipc_analisis$fecha)
@@ -272,7 +276,7 @@ meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FOREC
 fechas_test <- tail(ipc_analisis$fecha, H_BACKTEST)
 
 n1<-length(inf_ts); nt1<-n1-H_BACKTEST
-bt1<-Arima(window(inf_ts,end=time(inf_ts)[nt1]),order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
+bt1<-Arima(window(inf_ts,end=time(inf_ts)[nt1]),order=c(mejor_m2$p,0,mejor_m2$q),method="ML")
 fc1<-forecast(bt1,h=H_BACKTEST,level=c(80,95))
 fc_inf_m1 <- as.numeric(fc1$mean)
 obs_inf   <- tail(ipc_analisis$inf_mensual, H_BACKTEST)
@@ -318,7 +322,7 @@ ggplot(bt_df, aes(fecha,inf,color=tipo,linetype=tipo)) +
   geom_line(linewidth=0.9) + geom_point(size=2.5) +
   scale_color_manual(values=c(Observado="#2c3e50",`M1 Directo`="#e74c3c",`M2 Logarítmico`="#2980b9")) +
   scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="dashed")) +
-  labs(title=sprintf("Backtesting inflación mensual — %s",orden_comun),
+  labs(title=sprintf("Backtesting inflación mensual — M1:%s vs M2:%s",orden_m1,orden_m2),
        subtitle=sprintf("M1 RMSE=%.4f pp | M2 RMSE=%.4f pp",rmse1,rmse2),
        x=NULL,y="Inflación mensual (%)",color=NULL,linetype=NULL) +
   scale_x_date(date_breaks="1 month",date_labels="%b %Y") +
@@ -358,7 +362,7 @@ data.frame(Mes=mn[month(meses_pron)],
            M1_mens=round(inf_mens_m1,4), M1_ia=round(ia_m1,2),
            M2_mens=round(inf_mens_m2,4), M2_ia=round(ia_m2,2)) %>%
   kable(col.names=c("Mes","M1 mensual (%)","M1 interanual (%)","M2 mensual (%)","M2 interanual (%)"),
-        caption=sprintf("Proyección de inflación — %s forzado en ambos métodos",orden_comun),
+        caption=sprintf("Proyección de inflación — M1: %s vs M2: %s",orden_m1,orden_m2),
         align=c("l",rep("r",4))) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
 ```
@@ -377,7 +381,7 @@ bind_rows(ia_h %>% mutate(tipo="Observado"), ia_m1_l, ia_m2_l) %>%
   geom_line(linewidth=0.9) + geom_point(size=1.2) +
   scale_color_manual(values=c(Observado="black",`M1 Directo`="#e74c3c",`M2 Logarítmico`="blue")) +
   scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="solid")) +
-  labs(title=sprintf("Inflación interanual — %s",orden_comun),x=NULL,y="% interanual",color=NULL,linetype=NULL) +
+  labs(title=sprintf("Inflación interanual — M1:%s vs M2:%s",orden_m1,orden_m2),x=NULL,y="% interanual",color=NULL,linetype=NULL) +
   scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
@@ -423,38 +427,121 @@ tabla_cf %>%
 ```
 
 ```{r grafico-contrafactual, fig.height=5.5}
-ia_h2 <- ipc %>% filter(!is.na(inf_interanual), year(fecha) >= ANIO_INICIO) %>%
+library(ggrepel)
+
+ia_h2 <- ipc %>% 
+  filter(!is.na(inf_interanual), year(fecha) >= ANIO_INICIO) %>%
   select(fecha, yoy = inf_interanual)
+
 ult_ia2 <- tail(ia_h2, 1)
 
 cf_lineas <- bind_rows(
-  ia_h2 %>% mutate(tipo = "Observado"),
-  data.frame(fecha=c(ult_ia2$fecha, m2_jul_dic$fecha),
-             yoy=c(ult_ia2$yoy, m2_jul_dic$ia_contra),
-             tipo="Contrafactual ARIMA (M2)"),
-  data.frame(fecha=c(ult_ia2$fecha, esc_postbloq$fecha),
-             yoy=c(ult_ia2$yoy, esc_postbloq$ia_postbloq),
-             tipo="Post-bloqueos")
+  ia_h2 %>% 
+    mutate(tipo = "Observado"),
+  
+  data.frame(
+    fecha = c(ult_ia2$fecha, m2_jul_dic$fecha),
+    yoy = c(ult_ia2$yoy, m2_jul_dic$ia_contra),
+    tipo = "Contrafactual ARIMA (M2)"
+  ),
+  
+  data.frame(
+    fecha = c(ult_ia2$fecha, esc_postbloq$fecha),
+    yoy = c(ult_ia2$yoy, esc_postbloq$ia_postbloq),
+    tipo = "Post-bloqueos"
+  )
 )
 
-ggplot(cf_lineas, aes(fecha, yoy, color=tipo, linetype=tipo)) +
-  geom_line(linewidth=1) + geom_point(size=1.5) +
-  geom_ribbon(data=data.frame(fecha=esc_postbloq$fecha,
-    lo=m2_jul_dic$ia_contra, hi=esc_postbloq$ia_postbloq),
-    aes(fecha, ymin=lo, ymax=hi), inherit.aes=FALSE,
-    fill="#e74c3c", alpha=0.15) +
-  scale_color_manual(values=c(Observado="black",
-    `Contrafactual ARIMA (M2)`="blue", `Post-bloqueos`="#e74c3c")) +
-  scale_linetype_manual(values=c(Observado="solid",
-    `Contrafactual ARIMA (M2)`="solid", `Post-bloqueos`="dashed")) +
-  annotate("text", x=as.Date("2026-10-01"), y=mean(c(tail(m2_jul_dic$ia_contra,1),
-    tail(esc_postbloq$ia_postbloq,1))), label="Efecto\nbloqueos\n+ shocks",
-    color="#e74c3c", size=3.5, fontface="italic") +
-  labs(title="Inflación interanual — Contrafactual vs. Post-bloqueos",
-       subtitle=sprintf("Diferencia a dic 2026: %.1f pp", tail(tabla_cf$diferencia,1)),
-       x=NULL, y="% interanual", color=NULL, linetype=NULL) +
-  scale_x_date(date_breaks="4 months", date_labels="%b %Y") +
-  theme(axis.text.x=element_text(angle=45,hjust=1))
+# Etiquetas para el último valor de ambas series proyectadas
+etiquetas_finales <- cf_lineas %>%
+  filter(tipo %in% c("Contrafactual ARIMA (M2)", "Post-bloqueos")) %>%
+  filter(!is.na(yoy)) %>%
+  group_by(tipo) %>%
+  slice_max(fecha, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    etiqueta = sprintf("%.1f%%", yoy)
+  )
+
+ggplot(cf_lineas, aes(fecha, yoy, color = tipo, linetype = tipo)) +
+  geom_line(linewidth = 1) + 
+  geom_point(size = 1.5) +
+  
+  geom_ribbon(
+    data = data.frame(
+      fecha = esc_postbloq$fecha,
+      lo = m2_jul_dic$ia_contra,
+      hi = esc_postbloq$ia_postbloq
+    ),
+    aes(fecha, ymin = lo, ymax = hi),
+    inherit.aes = FALSE,
+    fill = "#e74c3c",
+    alpha = 0.15
+  ) +
+  
+  geom_label_repel(
+    data = etiquetas_finales,
+    aes(x = fecha, y = yoy, label = etiqueta, color = tipo),
+    inherit.aes = FALSE,
+    nudge_x = 25,
+    direction = "y",
+    hjust = 0,
+    size = 3.5,
+    show.legend = FALSE,
+    label.size = 0.2,
+    min.segment.length = 0
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      Observado = "black",
+      `Contrafactual ARIMA (M2)` = "blue",
+      `Post-bloqueos` = "#e74c3c"
+    )
+  ) +
+  
+  scale_linetype_manual(
+    values = c(
+      Observado = "solid",
+      `Contrafactual ARIMA (M2)` = "solid",
+      `Post-bloqueos` = "dashed"
+    )
+  ) +
+  
+  annotate(
+    "text",
+    x = as.Date("2026-10-01"),
+    y = mean(c(
+      tail(m2_jul_dic$ia_contra, 1),
+      tail(esc_postbloq$ia_postbloq, 1)
+    )),
+    label = "Efecto\nbloqueos\n+ políticas",
+    color = "#e74c3c",
+    size = 3.5,
+    fontface = "italic"
+  ) +
+  
+  labs(
+    title = "Inflación interanual — Contrafactual vs. Post-bloqueos",
+    subtitle = sprintf("Diferencia a dic 2026: %.1f pp", tail(tabla_cf$diferencia, 1)),
+    x = NULL,
+    y = "% interanual",
+    color = NULL,
+    linetype = NULL
+  ) +
+  
+  scale_x_date(
+    date_breaks = "4 months",
+    date_labels = "%b %Y",
+    expand = expansion(mult = c(0.02, 0.15))
+  ) +
+  
+  coord_cartesian(clip = "off") +
+  
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(5.5, 45, 5.5, 5.5)
+  )
 ```
 
 > A diciembre 2026, el escenario post-bloqueos proyecta una inflación interanual de **`r round(tail(esc_postbloq$ia_postbloq,1),1)`%**, mientras que el contrafactual ARIMA (M2) estima **`r round(tail(m2_jul_dic$ia_contra,1),1)`%** — una diferencia de **`r round(tail(tabla_cf$diferencia,1),1)` puntos porcentuales** atribuible al efecto de los bloqueos de mayo 2025.
@@ -463,5 +550,5 @@ ggplot(cf_lineas, aes(fecha, yoy, color=tipo, linetype=tipo)) +
 
 <center>
 *Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces.*
-*Especificación común `r orden_comun` forzada en ambos métodos para comparabilidad.*
+*M1: `r orden_m1` sobre inf. mensual (d=0) | M2: `r orden_m2` sobre log(IPC) (d=1). Mismo AR/MA, diferenciación equivalente.*
 </center>
