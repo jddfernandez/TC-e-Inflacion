@@ -1,0 +1,584 @@
+
+---
+title: "Proyección de Inflación en Bolivia"
+subtitle: "SARIMA, SARIMAX e Intervenciones"
+author: "Análisis Econométrico"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: { collapsed: false }
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: kable
+---
+
+<style>
+.title,.subtitle,.author,.date { text-align:center; }
+.subtitle { font-size:18px; color:#7f8c8d; font-style:italic; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
+  fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
+
+required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra","zoo")
+new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
+if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
+
+library(readxl);library(dplyr);library(lubridate);library(ggplot2)
+library(forecast);library(tseries);library(urca);library(lmtest)
+library(kableExtra);library(scales);library(gridExtra);library(zoo)
+
+tema <- theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
+        plot.subtitle=element_text(hjust=0.5,color="grey40",size=10),
+        panel.grid.minor=element_blank(), legend.position="bottom")
+theme_set(tema)
+
+RUTA_BD <- "Inputs/BD Bruta.xlsx"
+ANIO_INICIO <- 2019
+H_BACKTEST  <- 6
+H_FORECAST  <- 7
+```
+
+```{r carga, include=FALSE}
+meses_map <- c("Enero"=1,"Febrero"=2,"Marzo"=3,"Abril"=4,"Mayo"=5,
+               "Junio"=6,"Julio"=7,"Agosto"=8,"Septiembre"=9,
+               "Octubre"=10,"Noviembre"=11,"Diciembre"=12)
+
+ipc_raw <- read_excel(RUTA_BD, sheet="IPC")
+ipc <- ipc_raw %>%
+  mutate(Valor_num=suppressWarnings(as.numeric(Valor))) %>% filter(!is.na(Valor_num)) %>%
+  mutate(mes_num=meses_map[Mes], fecha=as.Date(paste(Año,mes_num,"01",sep="-")), IPC=Valor_num) %>%
+  arrange(fecha) %>% select(fecha,Año,Mes,mes_num,IPC) %>%
+  mutate(log_IPC=log(IPC),
+         inf_mensual=(IPC/lag(IPC)-1)*100,
+         inf_interanual=(IPC/lag(IPC,12)-1)*100)
+
+tc_raw <- read_excel(RUTA_BD, sheet="TC"); names(tc_raw) <- trimws(names(tc_raw))
+tc_mensual <- tc_raw %>%
+  mutate(fecha_date=as.Date(fecha), anio=year(fecha_date), mes=month(fecha_date)) %>%
+  group_by(anio, mes) %>%
+  summarise(TC_preferencial=mean(`TC PREFERENCIAL`,na.rm=TRUE),
+            TC_digital=mean(`TC-DIGITAL`,na.rm=TRUE),
+            TC_oficial=first(`TC-OFICIAL`),
+            TC_referencial=mean(`TC-REFERENCIAL`,na.rm=TRUE), .groups="drop") %>%
+  mutate(fecha=as.Date(paste(anio,mes,"01",sep="-")))
+
+## Serie desde 2019
+ipc_s <- ipc %>% filter(year(fecha) >= ANIO_INICIO, !is.na(IPC))
+
+log_ipc_ts <- ts(ipc_s$log_IPC,
+                 start=c(year(min(ipc_s$fecha)), month(min(ipc_s$fecha))),
+                 frequency=12)
+
+ultimo_mes <- max(ipc_s$fecha)
+meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FORECAST)
+
+## Dummies de intervencion
+fechas_s <- ipc_s$fecha
+dummy_covid   <- as.numeric(fechas_s >= as.Date("2020-03-01") & fechas_s <= as.Date("2020-08-01"))
+dummy_bloqueo <- as.numeric(fechas_s >= as.Date("2025-05-01") & fechas_s <= as.Date("2025-06-01"))
+xreg_dummies  <- cbind(COVID=dummy_covid, Bloqueo=dummy_bloqueo)
+
+## TC para SARIMAX — mensualizado con interpolacion de NAs
+tc_merge <- ipc_s %>%
+  select(fecha) %>%
+  left_join(tc_mensual %>% select(fecha, TC_digital, TC_referencial), by="fecha") %>%
+  mutate(
+    TC_digital     = na.approx(TC_digital,     na.rm=FALSE),
+    TC_referencial = na.approx(TC_referencial,  na.rm=FALSE),
+    TC_digital     = ifelse(is.na(TC_digital),     na.locf(TC_digital, fromLast=TRUE, na.rm=FALSE), TC_digital),
+    TC_referencial = ifelse(is.na(TC_referencial),  na.locf(TC_referencial, fromLast=TRUE, na.rm=FALSE), TC_referencial),
+    TC_digital     = ifelse(is.na(TC_digital),     6.96, TC_digital),
+    TC_referencial = ifelse(is.na(TC_referencial),  6.96, TC_referencial)
+  )
+
+xreg_tc <- cbind(TC_dig=tc_merge$TC_digital, TC_ref=tc_merge$TC_referencial)
+xreg_full <- cbind(xreg_dummies, xreg_tc)
+```
+
+# Datos y Descomposición Estacional
+
+Serie: **log(IPC)** desde enero `r ANIO_INICIO` (`r length(log_ipc_ts)` observaciones mensuales). Período suficiente para estimar componentes estacionales con $s = 12$.
+
+```{r decomp, fig.height=8}
+decomp <- stl(log_ipc_ts, s.window="periodic")
+autoplot(decomp) +
+  labs(title="Descomposición STL de log(IPC)") +
+  theme(plot.title=element_text(face="bold",hjust=0.5))
+```
+
+```{r dummies-plot, fig.height=4}
+data.frame(fecha=fechas_s, COVID=dummy_covid, Bloqueo=dummy_bloqueo) %>%
+  tidyr::pivot_longer(-fecha, names_to="Shock", values_to="valor") %>%
+  ggplot(aes(fecha, valor, fill=Shock)) +
+  geom_col(alpha=0.6, width=25, position="identity") +
+  scale_fill_manual(values=c(COVID="#e74c3c", Bloqueo="#f39c12")) +
+  labs(title="Variables dicotómicas de intervención",
+       subtitle="COVID: mar–ago 2020 | Bloqueos: may–jun 2025",
+       x=NULL, y="Dummy (0/1)") +
+  scale_x_date(date_breaks="6 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+# Pruebas de Raíz Unitaria y Estacionalidad
+
+```{r tests, include=FALSE}
+adf_log  <- adf.test(log_ipc_ts)
+pp_log   <- pp.test(log_ipc_ts)
+kpss_log <- kpss.test(log_ipc_ts, null="Level")
+dlog     <- diff(log_ipc_ts)
+adf_dlog <- adf.test(dlog)
+pp_dlog  <- pp.test(dlog)
+kpss_dlog<- kpss.test(dlog, null="Level")
+
+d_rec  <- ndiffs(log_ipc_ts, test="adf")
+D_rec  <- nsdiffs(log_ipc_ts, test="ocsb")
+```
+
+```{r tabla-raiz}
+cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
+
+data.frame(
+  Prueba=rep(c("ADF","PP","KPSS"),2),
+  H0=rep(c("Raíz unitaria","Raíz unitaria","Estacionaria"),2),
+  Rechazo=rep(c("p<0.05 → Estac.","p<0.05 → Estac.","p<0.05 → No estac."),2),
+  Serie=c(rep("log(IPC)",3), rep("Δlog(IPC)",3)),
+  Stat=round(c(adf_log$stat,pp_log$stat,kpss_log$stat,
+               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat),4),
+  p=round(c(adf_log$p.value,pp_log$p.value,kpss_log$p.value,
+            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value),4),
+  Conclusion=c(cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),
+               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"))
+) %>%
+  kable(col.names=c("Prueba","H₀","Rechazo","Serie","Estadístico","p-valor","Conclusión"),
+        caption="Pruebas de raíz unitaria",align=c("l","l","l","l","r","r","l")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE,font_size=11) %>%
+  pack_rows("log(IPC)",1,3) %>% pack_rows("Δlog(IPC)",4,6)
+```
+
+> Diferenciación regular recomendada: **d = `r d_rec`**. Diferenciación estacional: **D = `r D_rec`**.
+
+```{r acf-pacf, fig.height=5}
+serie_diff <- diff(log_ipc_ts)
+if (D_rec > 0) serie_diff <- diff(serie_diff, lag=12)
+par(mfrow=c(1,2),mar=c(4,4,3,1))
+Acf(serie_diff, lag.max=36, main=sprintf("ACF — Δ%slog(IPC)",ifelse(D_rec>0,"₁₂","") ))
+Pacf(serie_diff, lag.max=36, main=sprintf("PACF — Δ%slog(IPC)",ifelse(D_rec>0,"₁₂","")))
+par(mfrow=c(1,1))
+```
+
+---
+
+# Modelo A: SARIMA Puro
+
+```{r sarima-estim, include=FALSE}
+estimar_sarima <- function(serie, d_val, D_val, max_p=3, max_q=3, max_P=1, max_Q=1,
+                           xreg_train=NULL, etiqueta="") {
+  res <- data.frame()
+  for(p in 0:max_p) for(q in 0:max_q) for(P in 0:max_P) for(Q in 0:max_Q) {
+    if(p==0 && q==0 && P==0 && Q==0) next
+    fit <- try(Arima(serie, order=c(p,d_val,q), seasonal=c(P,D_val,Q),
+                     xreg=xreg_train, method="ML"), silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb <- tryCatch(Box.test(residuals(fit),lag=min(24,n-k-1),type="Ljung-Box",
+                              fitdf=length(coef(fit)))$p.value, error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+      nombre <- sprintf("(%d,%d,%d)(%d,%d,%d)[12]",p,d_val,q,P,D_val,Q)
+      res <- rbind(res, data.frame(
+        Modelo=nombre, p=p,d=d_val,q=q,P=P,D_val=D_val,Q=Q,
+        AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
+        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        LogLik=ll, LB=lb, Raices_ok=rok, Complexity=p+q+P+Q,
+        stringsAsFactors=FALSE))
+    }
+  }
+  if(nrow(res)==0) return(res)
+  res %>% mutate(
+    RMSE_s=as.numeric(scale(RMSE)), MAPE_s=as.numeric(scale(MAPE)),
+    AICc_s=as.numeric(scale(AICc)), BIC_s=as.numeric(scale(BIC)), HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),
+    LB_p=ifelse(is.na(LB)|LB<0.05,1,0), R_p=ifelse(!Raices_ok,1,0),
+    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p
+  ) %>% arrange(Score)
+}
+
+res_A <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec)
+mejor_A <- res_A[1,]
+
+ord_A <- c(mejor_A$p, mejor_A$d, mejor_A$q)
+sea_A <- c(mejor_A$P, mejor_A$D_val, mejor_A$Q)
+mod_A <- Arima(log_ipc_ts, order=ord_A, seasonal=sea_A, method="ML")
+```
+
+Se estiman SARIMA$(p,d,q)(P,D,Q)_{12}$ sobre log(IPC) con $d=`r d_rec`$, $D=`r D_rec`$, $p,q \in [0,3]$, $P,Q \in [0,1]$.
+
+```{r tabla-A}
+res_A %>% head(15) %>%
+  transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+            Score=round(Score,3)) %>%
+  kable(caption=sprintf("Modelo A: SARIMA puro — Top 15 de %d modelos",nrow(res_A)),
+        align=c("l",rep("r",6),"r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#27ae60")
+```
+
+> **Ganador A:** `r mejor_A$Modelo` (Score = `r round(mejor_A$Score,3)`)
+
+---
+
+# Modelo B: SARIMA + Intervenciones
+
+Se agregan dummies de **COVID** (mar–ago 2020) y **Bloqueos** (may–jun 2025) como regresores exógenos al SARIMA. Esto permite capturar los shocks sin que contaminen la estructura ARMA.
+
+```{r interv-estim, include=FALSE}
+res_B <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec,
+                        xreg_train=xreg_dummies)
+mejor_B <- res_B[1,]
+
+ord_B <- c(mejor_B$p, mejor_B$d, mejor_B$q)
+sea_B <- c(mejor_B$P, mejor_B$D_val, mejor_B$Q)
+mod_B <- Arima(log_ipc_ts, order=ord_B, seasonal=sea_B,
+               xreg=xreg_dummies, method="ML")
+
+coefs_B <- coef(mod_B)
+se_B <- sqrt(diag(vcov(mod_B)))
+pv_B <- 2*(1-pnorm(abs(coefs_B/se_B)))
+```
+
+```{r tabla-B}
+res_B %>% head(15) %>%
+  transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+            Score=round(Score,3)) %>%
+  kable(caption=sprintf("Modelo B: SARIMA + Intervenciones — Top 15 de %d modelos",nrow(res_B)),
+        align=c("l",rep("r",6),"r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#e67e22")
+```
+
+```{r coefs-interv}
+idx_dummy <- which(names(coefs_B) %in% c("COVID","Bloqueo"))
+if(length(idx_dummy) > 0) {
+  data.frame(
+    Variable=names(coefs_B)[idx_dummy],
+    Coef=round(coefs_B[idx_dummy],5),
+    SE=round(se_B[idx_dummy],5),
+    z=round(coefs_B[idx_dummy]/se_B[idx_dummy],3),
+    p=round(pv_B[idx_dummy],4),
+    Sig=ifelse(pv_B[idx_dummy]<0.01,"***",ifelse(pv_B[idx_dummy]<0.05,"**",
+        ifelse(pv_B[idx_dummy]<0.1,"*","")))
+  ) %>%
+    kable(col.names=c("Intervención","Coeficiente","Err. Std.","z","p-valor",""),
+          caption="Efecto estimado de las intervenciones sobre log(IPC)",
+          align=c("l","r","r","r","r","c"), row.names=FALSE) %>%
+    kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+}
+```
+
+> **Ganador B:** `r mejor_B$Modelo` (Score = `r round(mejor_B$Score,3)`)
+
+---
+
+# Modelo C: SARIMAX (con tipo de cambio)
+
+Se incorporan **TC digital** y **TC referencial** como variables exógenas, junto a las dummies de intervención. Los valores faltantes de TC se interpolan (zoo::na.approx) dado que TC digital inicia en oct-2023 y TC referencial finaliza en nov-2025.
+
+```{r sarimax-estim, include=FALSE}
+res_C <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec,
+                        xreg_train=xreg_full, max_p=2, max_q=2)
+mejor_C <- res_C[1,]
+
+ord_C <- c(mejor_C$p, mejor_C$d, mejor_C$q)
+sea_C <- c(mejor_C$P, mejor_C$D_val, mejor_C$Q)
+mod_C <- Arima(log_ipc_ts, order=ord_C, seasonal=sea_C,
+               xreg=xreg_full, method="ML")
+
+coefs_C <- coef(mod_C)
+se_C <- sqrt(diag(vcov(mod_C)))
+pv_C <- 2*(1-pnorm(abs(coefs_C/se_C)))
+```
+
+```{r tabla-C}
+if(nrow(res_C) > 0) {
+  res_C %>% head(15) %>%
+    transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+              RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+              Score=round(Score,3)) %>%
+    kable(caption=sprintf("Modelo C: SARIMAX — Top 15 de %d modelos",nrow(res_C)),
+          align=c("l",rep("r",6),"r")) %>%
+    kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+    row_spec(1,bold=TRUE,color="white",background="#8e44ad")
+}
+```
+
+```{r coefs-xreg}
+idx_xr <- which(names(coefs_C) %in% c("COVID","Bloqueo","TC_dig","TC_ref"))
+if(length(idx_xr) > 0) {
+  data.frame(
+    Variable=names(coefs_C)[idx_xr],
+    Coef=round(coefs_C[idx_xr],5),
+    SE=round(se_C[idx_xr],5),
+    z=round(coefs_C[idx_xr]/se_C[idx_xr],3),
+    p=round(pv_C[idx_xr],4),
+    Sig=ifelse(pv_C[idx_xr]<0.01,"***",ifelse(pv_C[idx_xr]<0.05,"**",
+        ifelse(pv_C[idx_xr]<0.1,"*","")))
+  ) %>%
+    kable(col.names=c("Variable","Coeficiente","Err. Std.","z","p-valor",""),
+          caption="Coeficientes de regresores exógenos en SARIMAX",
+          align=c("l","r","r","r","r","c"), row.names=FALSE) %>%
+    kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+}
+```
+
+> **Ganador C:** `r mejor_C$Modelo` (Score = `r round(mejor_C$Score,3)`)
+
+---
+
+# Comparación de los Tres Enfoques
+
+```{r comparacion}
+comp <- data.frame(
+  Criterio=c("Modelo","Score","AICc","BIC","HQ","RMSE","MAPE","Ljung-Box (p)"),
+  A_SARIMA=c(mejor_A$Modelo, round(mejor_A$Score,3), round(mejor_A$AICc,2),
+             round(mejor_A$BIC,2), round(mejor_A$HQ,2), round(mejor_A$RMSE,5),
+             round(mejor_A$MAPE,3), round(mejor_A$LB,4)),
+  B_Interv=c(mejor_B$Modelo, round(mejor_B$Score,3), round(mejor_B$AICc,2),
+             round(mejor_B$BIC,2), round(mejor_B$HQ,2), round(mejor_B$RMSE,5),
+             round(mejor_B$MAPE,3), round(mejor_B$LB,4)),
+  C_SARIMAX=c(mejor_C$Modelo, round(mejor_C$Score,3), round(mejor_C$AICc,2),
+              round(mejor_C$BIC,2), round(mejor_C$HQ,2), round(mejor_C$RMSE,5),
+              round(mejor_C$MAPE,3), round(mejor_C$LB,4))
+)
+kable(comp, col.names=c("Criterio","A: SARIMA","B: + Intervenciones","C: + TC exógeno"),
+      caption="Comparación de los tres enfoques", align=c("l","r","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+```{r diagnostico-3, fig.height=6}
+par(mfrow=c(3,3), mar=c(3,3,3,1))
+rA<-residuals(mod_A); rB<-residuals(mod_B); rC<-residuals(mod_C)
+plot(rA,main="A: Residuos",col="#27ae60",ylab=""); abline(h=0,lty=2)
+Acf(rA,main="A: ACF",lag.max=24)
+qqnorm(rA,main="A: Q-Q",col="#27ae60",pch=16); qqline(rA,col="grey50")
+plot(rB,main="B: Residuos",col="#e67e22",ylab=""); abline(h=0,lty=2)
+Acf(rB,main="B: ACF",lag.max=24)
+qqnorm(rB,main="B: Q-Q",col="#e67e22",pch=16); qqline(rB,col="grey50")
+plot(rC,main="C: Residuos",col="#8e44ad",ylab=""); abline(h=0,lty=2)
+Acf(rC,main="C: ACF",lag.max=24)
+qqnorm(rC,main="C: Q-Q",col="#8e44ad",pch=16); qqline(rC,col="grey50")
+par(mfrow=c(1,1))
+```
+
+---
+
+# Backtesting
+
+Se reservan los últimos `r H_BACKTEST` meses. Cada modelo se re-estima y compara en **inflación interanual**.
+
+```{r backtesting}
+n <- length(log_ipc_ts); nt <- n - H_BACKTEST
+train_ts    <- window(log_ipc_ts, end=time(log_ipc_ts)[nt])
+test_ts     <- window(log_ipc_ts, start=time(log_ipc_ts)[nt+1])
+fechas_test <- tail(ipc_s$fecha, H_BACKTEST)
+ipc_obs     <- tail(ipc_s$IPC, H_BACKTEST)
+
+xd_tr <- xreg_dummies[1:nt,]; xd_te <- xreg_dummies[(nt+1):n,]
+xf_tr <- xreg_full[1:nt,];    xf_te <- xreg_full[(nt+1):n,]
+
+bt_A <- forecast(Arima(train_ts,order=ord_A,seasonal=sea_A,method="ML"),h=H_BACKTEST)
+bt_B <- forecast(Arima(train_ts,order=ord_B,seasonal=sea_B,xreg=xd_tr,method="ML"),
+                 h=H_BACKTEST, xreg=xd_te)
+bt_C <- forecast(Arima(train_ts,order=ord_C,seasonal=sea_C,xreg=xf_tr,method="ML"),
+                 h=H_BACKTEST, xreg=xf_te)
+
+ipc_A <- exp(as.numeric(bt_A$mean))
+ipc_B <- exp(as.numeric(bt_B$mean))
+ipc_C <- exp(as.numeric(bt_C$mean))
+
+mape_f <- function(obs,pred) mean(abs((pred-obs)/obs))*100
+rmse_f <- function(obs,pred) sqrt(mean((pred-obs)^2))
+```
+
+```{r tabla-bt}
+data.frame(Fecha=format(fechas_test,"%b %Y"),
+           IPC_obs=round(ipc_obs,2),
+           A=round(ipc_A,2), B=round(ipc_B,2), C=round(ipc_C,2)) %>%
+  kable(col.names=c("Fecha","IPC obs.","A: SARIMA","B: +Interv.","C: +TC"),
+        caption="Backtesting — IPC pronosticado por modelo",align=c("l",rep("r",4))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r metricas-bt}
+data.frame(
+  Metrica=c("RMSE (IPC)","MAPE (IPC %)"),
+  A=c(round(rmse_f(ipc_obs,ipc_A),4), paste0(round(mape_f(ipc_obs,ipc_A),2),"%")),
+  B=c(round(rmse_f(ipc_obs,ipc_B),4), paste0(round(mape_f(ipc_obs,ipc_B),2),"%")),
+  C=c(round(rmse_f(ipc_obs,ipc_C),4), paste0(round(mape_f(ipc_obs,ipc_C),2),"%"))
+) %>%
+  kable(col.names=c("Métrica","A: SARIMA","B: +Interv.","C: +TC"),
+        caption="Métricas de backtesting comparadas",align=c("l","r","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r grafico-bt, fig.height=5}
+bt_all <- bind_rows(
+  data.frame(fecha=fechas_test, IPC=ipc_obs, modelo="Observado"),
+  data.frame(fecha=fechas_test, IPC=ipc_A,   modelo="A: SARIMA"),
+  data.frame(fecha=fechas_test, IPC=ipc_B,   modelo="B: +Interv."),
+  data.frame(fecha=fechas_test, IPC=ipc_C,   modelo="C: +TC"))
+cols3 <- c(Observado="#2c3e50",`A: SARIMA`="#27ae60",`B: +Interv.`="#e67e22",`C: +TC`="#8e44ad")
+
+ggplot(bt_all, aes(fecha,IPC,color=modelo)) +
+  geom_line(linewidth=0.9) + geom_point(size=2.5) +
+  scale_color_manual(values=cols3) +
+  labs(title="Backtesting IPC — Tres enfoques",
+       subtitle=sprintf("MAPE: A=%.2f%% | B=%.2f%% | C=%.2f%%",
+         mape_f(ipc_obs,ipc_A),mape_f(ipc_obs,ipc_B),mape_f(ipc_obs,ipc_C)),
+       x=NULL,y="IPC",color=NULL) +
+  scale_x_date(date_breaks="1 month",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+# Pronóstico
+
+```{r pronostico}
+xd_fut <- matrix(0, nrow=H_FORECAST, ncol=2, dimnames=list(NULL, c("COVID","Bloqueo")))
+
+tc_last <- tail(tc_merge, 1)
+xreg_tc_fut <- matrix(rep(c(tc_last$TC_digital, tc_last$TC_referencial), each=H_FORECAST),
+                      nrow=H_FORECAST, ncol=2, dimnames=list(NULL, c("TC_dig","TC_ref")))
+xf_fut <- cbind(xd_fut, xreg_tc_fut)
+
+fc_A <- forecast(mod_A, h=H_FORECAST, level=c(80,95))
+fc_B <- forecast(mod_B, h=H_FORECAST, level=c(80,95), xreg=xd_fut)
+fc_C <- forecast(mod_C, h=H_FORECAST, level=c(80,95), xreg=xf_fut)
+
+ipc_pA <- exp(as.numeric(fc_A$mean))
+ipc_pB <- exp(as.numeric(fc_B$mean))
+ipc_pC <- exp(as.numeric(fc_C$mean))
+
+ipc_hist <- ipc$IPC[!is.na(ipc$IPC)]; fechas_hist <- ipc$fecha[!is.na(ipc$IPC)]
+der_ia <- function(ipv) {
+  ic<-c(ipc_hist,ipv); fc<-c(fechas_hist,meses_pron)
+  sapply(seq_along(meses_pron),function(i)(ipv[i]/ic[which.min(abs(fc-(meses_pron[i]%m-%months(12))))]-1)*100)
+}
+der_im <- function(ipv) {
+  prev <- c(tail(ipc_hist,1), head(ipv,-1))
+  (ipv/prev - 1)*100
+}
+
+ia_A<-der_ia(ipc_pA); ia_B<-der_ia(ipc_pB); ia_C<-der_ia(ipc_pC)
+im_A<-der_im(ipc_pA); im_B<-der_im(ipc_pB); im_C<-der_im(ipc_pC)
+```
+
+## Proyección comparada — Inflación
+
+```{r tabla-proy}
+mn<-c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto",
+      "Septiembre","Octubre","Noviembre","Diciembre")
+data.frame(Mes=mn[month(meses_pron)],
+           A_im=round(im_A,3), A_ia=round(ia_A,2),
+           B_im=round(im_B,3), B_ia=round(ia_B,2),
+           C_im=round(im_C,3), C_ia=round(ia_C,2)) %>%
+  kable(col.names=c("Mes","A mens.","A interan.","B mens.","B interan.","C mens.","C interan."),
+        caption="Proyección de inflación (%) — Tres enfoques",align=c("l",rep("r",6))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+## Inflación interanual — Tres enfoques
+
+```{r yoy, fig.height=5.5}
+ia_h <- ipc %>% filter(!is.na(inf_interanual), year(fecha)>=ANIO_INICIO) %>%
+  select(fecha, yoy=inf_interanual)
+ult <- tail(ia_h,1)
+
+ia_all <- bind_rows(
+  ia_h %>% mutate(modelo="Observado"),
+  data.frame(fecha=c(ult$fecha,meses_pron), yoy=c(ult$yoy,ia_A), modelo="A: SARIMA"),
+  data.frame(fecha=c(ult$fecha,meses_pron), yoy=c(ult$yoy,ia_B), modelo="B: +Interv."),
+  data.frame(fecha=c(ult$fecha,meses_pron), yoy=c(ult$yoy,ia_C), modelo="C: +TC"))
+
+ggplot(ia_all, aes(fecha,yoy,color=modelo,linetype=modelo)) +
+  geom_line(linewidth=0.9) + geom_point(size=1) +
+  scale_color_manual(values=c(Observado="black",`A: SARIMA`="#27ae60",
+                               `B: +Interv.`="#e67e22",`C: +TC`="#8e44ad")) +
+  scale_linetype_manual(values=c(Observado="solid",`A: SARIMA`="solid",
+                                  `B: +Interv.`="dashed",`C: +TC`="dotted")) +
+  labs(title="Inflación interanual — SARIMA, Intervenciones y SARIMAX",
+       x=NULL, y="% interanual", color=NULL, linetype=NULL) +
+  scale_x_date(date_breaks="6 months",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+## Contrafactual vs. Post-Bloqueos
+
+```{r contrafactual}
+esc_postbloq <- data.frame(
+  fecha=as.Date(c("2026-07-01","2026-08-01","2026-09-01",
+                   "2026-10-01","2026-11-01","2026-12-01")),
+  ia_postbloq=c(12.70, 13.40, 14.63, 15.38, 16.29, 16.90))
+
+idx_jul <- meses_pron >= as.Date("2026-07-01")
+
+tabla_cf <- data.frame(
+  Mes=mn[month(meses_pron[idx_jul])],
+  B_ia=round(ia_B[idx_jul],2),
+  Post=round(esc_postbloq$ia_postbloq,2),
+  Dif=round(esc_postbloq$ia_postbloq - ia_B[idx_jul],2))
+
+kable(tabla_cf, col.names=c("Mes","Contrafactual (B) %","Post-bloqueos %","Diferencia (pp)"),
+      caption="Contrafactual SARIMA+Interv. vs. escenario post-bloqueos",
+      align=c("l","r","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
+  column_spec(4, bold=TRUE, color="#e74c3c")
+```
+
+```{r grafico-cf, fig.height=5}
+cf_df <- bind_rows(
+  ia_h %>% mutate(tipo="Observado"),
+  data.frame(fecha=c(ult$fecha,meses_pron[idx_jul]),
+             yoy=c(ult$yoy,ia_B[idx_jul]), tipo="Contrafactual (B)"),
+  data.frame(fecha=c(ult$fecha,esc_postbloq$fecha),
+             yoy=c(ult$yoy,esc_postbloq$ia_postbloq), tipo="Post-bloqueos"))
+
+ggplot(cf_df, aes(fecha,yoy,color=tipo,linetype=tipo)) +
+  geom_line(linewidth=1) + geom_point(size=1.5) +
+  geom_ribbon(data=data.frame(fecha=esc_postbloq$fecha,
+    lo=ia_B[idx_jul], hi=esc_postbloq$ia_postbloq),
+    aes(fecha,ymin=lo,ymax=hi), inherit.aes=FALSE, fill="#e74c3c", alpha=0.15) +
+  scale_color_manual(values=c(Observado="black",`Contrafactual (B)`="#e67e22",
+                               `Post-bloqueos`="#e74c3c")) +
+  scale_linetype_manual(values=c(Observado="solid",`Contrafactual (B)`="solid",
+                                  `Post-bloqueos`="dashed")) +
+  annotate("text",x=as.Date("2026-10-01"),
+           y=mean(c(tail(ia_B[idx_jul],1),tail(esc_postbloq$ia_postbloq,1))),
+           label="Efecto\nbloqueos",color="#e74c3c",size=3.5,fontface="italic") +
+  labs(title="Inflación interanual — Contrafactual vs. Post-bloqueos",
+       subtitle=sprintf("Diferencia a dic 2026: %.1f pp",
+                        tail(esc_postbloq$ia_postbloq,1) - tail(ia_B[idx_jul],1)),
+       x=NULL,y="% interanual",color=NULL,linetype=NULL) +
+  scale_x_date(date_breaks="6 months",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+<center>
+*Modelos estimados sobre log(IPC) desde `r ANIO_INICIO` (n=`r length(log_ipc_ts)`).*
+*A: SARIMA puro | B: + dummies COVID y Bloqueos | C: + TC digital y referencial.*
+</center>

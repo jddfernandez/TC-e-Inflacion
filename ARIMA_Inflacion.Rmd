@@ -98,7 +98,9 @@ grid.arrange(p1, p2, p3, ncol=1)
 
 ```{r tabla-bd}
 bd_mensual %>%
+  mutate(dlog_IPC = log_IPC - lag(log_IPC)) %>%
   transmute(Fecha=format(fecha,"%b %Y"), IPC=round(IPC,2), `log(IPC)`=round(log_IPC,4),
+            `Δlog(IPC)*100`=round(dlog_IPC,5)*100,
             `Inf.mens.(%)`=round(inf_mensual,3), `Inf.ia.(%)`=round(inf_interanual,2),
             `TC Pref.`=round(TC_preferencial,2), `TC Oficial`=TC_oficial) %>%
   kable(caption="Base mensual consolidada",align="r") %>%
