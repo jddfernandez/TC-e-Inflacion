@@ -59,18 +59,59 @@ fprintf('  Curtosis : %.4f\n', kurtosis(dlogIPC));
 %% 3. Pruebas de raiz unitaria
 
 fprintf('\n===== PRUEBAS DE RAIZ UNITARIA =====\n');
+fprintf('  H0 (ADF / PP / ZA) : serie tiene raiz unitaria\n');
+fprintf('  H0 (KPSS)          : serie es estacionaria\n');
+fprintf('  ZA: H1 = estacionaria con un quiebre estructural unico en fecha desconocida\n\n');
 
-[~, p_adf_log]  = adftest(logIPC);
-[~, p_pp_log]   = pptest(logIPC);
-[~, p_kpss_log] = kpsstest(logIPC);
+% --- ADF, Phillips-Perron, KPSS ---
+[~, p_adf_log]   = adftest(logIPC);
+[~, p_pp_log]    = pptest(logIPC);
+[~, p_kpss_log]  = kpsstest(logIPC);
 [~, p_adf_dlog]  = adftest(dlogIPC);
 [~, p_pp_dlog]   = pptest(dlogIPC);
 [~, p_kpss_dlog] = kpsstest(dlogIPC);
 
-fprintf('  log(IPC)   : ADF p=%.4f | PP p=%.4f | KPSS p=%.4f\n', ...
-    p_adf_log, p_pp_log, p_kpss_log);
-fprintf('  Dlog(IPC)  : ADF p=%.4f | PP p=%.4f | KPSS p=%.4f\n', ...
-    p_adf_dlog, p_pp_dlog, p_kpss_dlog);
+% --- Zivot-Andrews ---
+% Modelo 'ARD': permite quiebre en constante y tendencia (mas general)
+% breakDate: indice del quiebre optimo dentro del trimming (10%-90% muestra)
+za_ok = false;
+try
+    [~, p_za_log,  ~, ~, bd_log]  = zatest(logIPC,  'Model','ARD');
+    [~, p_za_dlog, ~, ~, bd_dlog] = zatest(dlogIPC, 'Model','ARD');
+    za_ok = true;
+catch ME
+    warning('zatest no disponible: %s', ME.message);
+    p_za_log = NaN; p_za_dlog = NaN;
+end
+
+% --- Tabla de resultados ---
+fprintf('  %-24s  log(IPC)                     Dlog(IPC)\n', 'Prueba');
+fprintf('  %s\n', repmat('-',1,72));
+fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'ADF', ...
+    p_adf_log,  ternary(p_adf_log<0.05,  '[Estacionaria]  ','[Raiz unitaria]'), ...
+    p_adf_dlog, ternary(p_adf_dlog<0.05, '[Estacionaria]','[Raiz unitaria]'));
+fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'Phillips-Perron', ...
+    p_pp_log,   ternary(p_pp_log<0.05,   '[Estacionaria]  ','[Raiz unitaria]'), ...
+    p_pp_dlog,  ternary(p_pp_dlog<0.05,  '[Estacionaria]','[Raiz unitaria]'));
+fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'KPSS (H0: estac.)', ...
+    p_kpss_log,  ternary(p_kpss_log<0.05,  '[Raiz unitaria] ','[Estacionaria] '), ...
+    p_kpss_dlog, ternary(p_kpss_dlog<0.05, '[Raiz unitaria]','[Estacionaria]'));
+if za_ok
+    fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'Zivot-Andrews (*)', ...
+        p_za_log,  ternary(p_za_log<0.05,  '[Estac.+quiebre]','[Raiz unitaria]'), ...
+        p_za_dlog, ternary(p_za_dlog<0.05, '[Estac.+quiebre]','[Raiz unitaria]'));
+    % Mapeo de fechas de quiebre
+    % dlogIPC(i) = logIPC(i+1)-logIPC(i) -> quiebre en dlogIPC(bd) ~ fechas(bd+1)
+    try
+        fd_log  = fechas(bd_log);
+        fd_dlog = fechas(min(bd_dlog + 1, length(fechas)));
+        fprintf('  Fecha de quiebre: log(IPC) = %-10s  |  Dlog(IPC) = %s\n', ...
+            datestr(fd_log,'mmm yyyy'), datestr(fd_dlog,'mmm yyyy'));
+    catch; end
+    fprintf('  (*) Rechazo implica estacionariedad condicionada al quiebre detectado\n');
+else
+    fprintf('  %-24s  (zatest no disponible en este entorno MATLAB)\n', 'Zivot-Andrews');
+end
 
 %% 4. Identificacion ACF / PACF
 
