@@ -398,14 +398,15 @@ La proyección ARIMA (M2) captura la dinámica tendencial de la inflación **sin
 esc_postbloq <- data.frame(
   fecha = as.Date(c("2026-07-01","2026-08-01","2026-09-01",
                      "2026-10-01","2026-11-01","2026-12-01")),
-  ia_postbloq = c(12.69994503, 13.39646203, 14.62735650,
-                   15.38052115, 16.28583617, 16.90125995)
+  ia_postbloq = c(10.1178, 10.5425, 11.6078,
+                   12.2512, 13.0547, 13.6194)
 )
 
+ventana_cf <- meses_pron >= min(esc_postbloq$fecha) & meses_pron <= max(esc_postbloq$fecha)
 m2_jul_dic <- data.frame(
-  fecha = meses_pron[meses_pron >= as.Date("2026-07-01")],
-  ia_contra = ia_m2[meses_pron >= as.Date("2026-07-01")],
-  mens_contra = inf_mens_m2[meses_pron >= as.Date("2026-07-01")]
+  fecha = meses_pron[ventana_cf],
+  ia_contra = ia_m2[ventana_cf],
+  mens_contra = inf_mens_m2[ventana_cf]
 )
 
 tabla_cf <- m2_jul_dic %>%
@@ -465,6 +466,13 @@ etiquetas_finales <- cf_lineas %>%
     etiqueta = sprintf("%.1f%%", yoy)
   )
 
+# Ancla de la anotación: centrada bajo la ventana de comparación, por debajo
+# de ambas series. Evita el hueco entre las dos líneas (que se angosta o
+# ensancha cada vez que se actualizan los datos post-bloqueos) y también las
+# etiquetas de valor final ancladas al último mes.
+x_anot <- tabla_cf$fecha[ceiling(nrow(tabla_cf) / 2)]
+y_anot <- min(c(tabla_cf$ia_contra, tabla_cf$ia_postbloq)) - 2.5
+
 ggplot(cf_lineas, aes(fecha, yoy, color = tipo, linetype = tipo)) +
   geom_line(linewidth = 1) + 
   geom_point(size = 1.5) +
@@ -511,16 +519,16 @@ ggplot(cf_lineas, aes(fecha, yoy, color = tipo, linetype = tipo)) +
   ) +
   
   annotate(
-    "text",
-    x = as.Date("2026-10-01"),
-    y = mean(c(
-      tail(m2_jul_dic$ia_contra, 1),
-      tail(esc_postbloq$ia_postbloq, 1)
-    )),
-    label = "Efecto\nbloqueos\n+ políticas",
+    "label",
+    x = x_anot,
+    y = y_anot,
+    label = "Efecto bloqueos + políticas",
     color = "#e74c3c",
-    size = 3.5,
-    fontface = "italic"
+    size = 3.2,
+    fontface = "italic",
+    fill = "white",
+    alpha = 0.8,
+    label.size = NA
   ) +
   
   labs(
