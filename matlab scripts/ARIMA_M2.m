@@ -12,7 +12,8 @@
 % en la misma carpeta que este script.
 
 clc; clear; close all;
-scriptDir = fileparts(mfilename('fullpath'));
+PROJ_ROOT = 'C:\Users\Juande\Documents\Scripts Python\TC e π';
+scriptDir = fullfile(PROJ_ROOT, 'matlab scripts');
 cd(scriptDir);
 
 %% 0. Configuracion
@@ -21,7 +22,7 @@ H_BACKTEST  = 6;
 H_FORECAST  = 7;
 MAX_P = 4;
 MAX_Q = 4;
-RUTA_OUTPUT = fullfile(scriptDir, '..', 'Outputs', 'Proyecciones_MATLAB.xlsx');
+RUTA_OUTPUT = fullfile(PROJ_ROOT, 'Outputs', 'Proyecciones_MATLAB.xlsx');
 addpath 'C:\Users\Juande\Documents\Scripts Python\TC e π\matlab scripts';
 
 %% 1. Carga de datos (workspace pre-importado)
@@ -67,50 +68,79 @@ fprintf('  ZA: H1 = estacionaria con un quiebre estructural unico en fecha desco
 [~, p_adf_log]   = adftest(logIPC);
 [~, p_pp_log]    = pptest(logIPC);
 [~, p_kpss_log]  = kpsstest(logIPC);
+
 [~, p_adf_dlog]  = adftest(dlogIPC);
 [~, p_pp_dlog]   = pptest(dlogIPC);
 [~, p_kpss_dlog] = kpsstest(dlogIPC);
 
-% --- Zivot-Andrews ---
-% Modelo 'ARD': permite quiebre en constante y tendencia (mas general)
-% breakDate: indice del quiebre optimo dentro del trimming (10%-90% muestra)
+% --- Zivot-Andrews (zatest.m) ---
+% Modelo 'ARD' = quiebre en intercepto y tendencia (caso mas general).
+
 za_ok = false;
+
 try
-    [~, p_za_log,  ~, ~, bd_log]  = zatest(logIPC,  'Model','ARD');
-    [~, p_za_dlog, ~, ~, bd_dlog] = zatest(dlogIPC, 'Model','ARD');
+    [h_za_log,  p_za_log,  stat_za_log,  cv_za_log,  bd_log]  = zatest(logIPC,  'Model','ARD');
+    [h_za_dlog, p_za_dlog, stat_za_dlog, cv_za_dlog, bd_dlog] = zatest(dlogIPC, 'Model','ARD');
+
     za_ok = true;
+
 catch ME
-    warning('zatest no disponible: %s', ME.message);
-    p_za_log = NaN; p_za_dlog = NaN;
+    warning('zatest no pudo calcularse: %s', ME.message);
+
+    p_za_log  = NaN;
+    p_za_dlog = NaN;
+
+    bd_log  = NaN;
+    bd_dlog = NaN;
 end
 
 % --- Tabla de resultados ---
 fprintf('  %-24s  log(IPC)                     Dlog(IPC)\n', 'Prueba');
-fprintf('  %s\n', repmat('-',1,72));
+fprintf('  %s\n', repmat('-',1,82));
+
 fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'ADF', ...
-    p_adf_log,  ternary(p_adf_log<0.05,  '[Estacionaria]  ','[Raiz unitaria]'), ...
-    p_adf_dlog, ternary(p_adf_dlog<0.05, '[Estacionaria]','[Raiz unitaria]'));
+    p_adf_log,  ternary(p_adf_log<0.05,  '[Estacionaria]  ', '[Raiz unitaria]'), ...
+    p_adf_dlog, ternary(p_adf_dlog<0.05, '[Estacionaria]',   '[Raiz unitaria]'));
+
 fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'Phillips-Perron', ...
-    p_pp_log,   ternary(p_pp_log<0.05,   '[Estacionaria]  ','[Raiz unitaria]'), ...
-    p_pp_dlog,  ternary(p_pp_dlog<0.05,  '[Estacionaria]','[Raiz unitaria]'));
+    p_pp_log,  ternary(p_pp_log<0.05,  '[Estacionaria]  ', '[Raiz unitaria]'), ...
+    p_pp_dlog, ternary(p_pp_dlog<0.05, '[Estacionaria]',   '[Raiz unitaria]'));
+
 fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'KPSS (H0: estac.)', ...
-    p_kpss_log,  ternary(p_kpss_log<0.05,  '[Raiz unitaria] ','[Estacionaria] '), ...
-    p_kpss_dlog, ternary(p_kpss_dlog<0.05, '[Raiz unitaria]','[Estacionaria]'));
+    p_kpss_log,  ternary(p_kpss_log<0.05,  '[Raiz unitaria] ', '[Estacionaria] '), ...
+    p_kpss_dlog, ternary(p_kpss_dlog<0.05, '[Raiz unitaria]',  '[Estacionaria]'));
+
 if za_ok
-    fprintf('  %-24s  p=%.4f  %-18s  p=%.4f  %s\n', 'Zivot-Andrews (*)', ...
-        p_za_log,  ternary(p_za_log<0.05,  '[Estac.+quiebre]','[Raiz unitaria]'), ...
-        p_za_dlog, ternary(p_za_dlog<0.05, '[Estac.+quiebre]','[Raiz unitaria]'));
+    fprintf('  %-24s  tau=%.4f p≈%.4f %-14s  tau=%.4f p≈%.4f %s\n', ...
+        'Zivot-Andrews (*)', ...
+        stat_za_log, ...
+        p_za_log, ...
+        ternary(h_za_log, '[Estac.+quiebre]', '[Raiz unitaria]'), ...
+        stat_za_dlog, ...
+        p_za_dlog, ...
+        ternary(h_za_dlog, '[Estac.+quiebre]', '[Raiz unitaria]'));
+
     % Mapeo de fechas de quiebre
-    % dlogIPC(i) = logIPC(i+1)-logIPC(i) -> quiebre en dlogIPC(bd) ~ fechas(bd+1)
+    % dlogIPC(i) = logIPC(i+1)-logIPC(i)
+    % Entonces, el quiebre de dlogIPC en i se reporta como fechas(i+1).
+
     try
         fd_log  = fechas(bd_log);
         fd_dlog = fechas(min(bd_dlog + 1, length(fechas)));
+
         fprintf('  Fecha de quiebre: log(IPC) = %-10s  |  Dlog(IPC) = %s\n', ...
             datestr(fd_log,'mmm yyyy'), datestr(fd_dlog,'mmm yyyy'));
-    catch; end
+
+        fprintf('  CV 5%% (modelo ARD): log(IPC)=%.3f | Dlog(IPC)=%.3f\n', ...
+            cv_za_log, cv_za_dlog);
+    catch
+    end
+
     fprintf('  (*) Rechazo implica estacionariedad condicionada al quiebre detectado\n');
+    fprintf('      p≈ es una aproximacion; la decision principal usa valores criticos.\n');
+
 else
-    fprintf('  %-24s  (zatest no disponible en este entorno MATLAB)\n', 'Zivot-Andrews');
+    fprintf('  %-24s  (zatest no disponible en este entorno)\n', 'Zivot-Andrews');
 end
 
 %% 4. Identificacion ACF / PACF
@@ -386,7 +416,12 @@ fprintf('  IPC dic 2026    : %.2f\n', ipc_proy(end));
 fprintf('  Inf. ia dic 2026: %.2f%%\n', inf_ia_proy(end));
 fprintf('==========================================================\n');
 
-%% Funcion auxiliar
+%% Funciones auxiliares
+
 function out = ternary(cond, a, b)
-  if cond, out = a; else, out = b; end
+    if cond
+        out = a;
+    else
+        out = b;
+    end
 end
