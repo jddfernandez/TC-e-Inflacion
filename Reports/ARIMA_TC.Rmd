@@ -1,0 +1,432 @@
+
+---
+title: "Proyección del Tipo de Cambio Digital en Bolivia"
+subtitle: "Modelo ARIMA — Metodología de Box-Jenkins"
+author: "Análisis Econométrico"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: { collapsed: false }
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: kable
+---
+
+<style>
+.title,.subtitle,.author,.date { text-align:center; }
+.subtitle { font-size:18px; color:#7f8c8d; font-style:italic; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
+  fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
+
+required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra")
+new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
+if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
+
+library(readxl);library(dplyr);library(lubridate);library(ggplot2)
+library(forecast);library(tseries);library(urca);library(lmtest)
+library(kableExtra);library(scales);library(gridExtra)
+
+tema <- theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
+        plot.subtitle=element_text(hjust=0.5,color="grey40",size=10),
+        panel.grid.minor=element_blank(), legend.position="bottom")
+theme_set(tema)
+
+RUTA_BD <- "../Inputs/BD Bruta.xlsx"
+
+## El TC digital solo tiene cotizacion real desde oct-2023 (mercado paralelo/
+## digital), y oct-2023 y jul-2026 son meses PARCIALES (13/31 y 16/31 dias
+## respectivamente). Se usa la ventana de meses completos: nov-2023 a jun-2026
+## (el mismo ultimo mes cerrado que usan los reportes de inflacion).
+FECHA_INICIO <- as.Date("2023-11-01")
+FECHA_FIN    <- as.Date("2026-06-01")
+H_BACKTEST <- 6; H_FORECAST <- 7; MAX_P <- 4; MAX_Q <- 4
+```
+
+```{r carga, include=FALSE}
+tc_raw <- read_excel(RUTA_BD, sheet="TC"); names(tc_raw) <- trimws(names(tc_raw))
+tc_mensual <- tc_raw %>%
+  mutate(fecha_date=as.Date(fecha), anio=year(fecha_date), mes=month(fecha_date)) %>%
+  group_by(anio, mes) %>%
+  summarise(TC_digital=mean(`TC-DIGITAL`,na.rm=TRUE), dias=n(), .groups="drop") %>%
+  mutate(fecha=as.Date(paste(anio,mes,"01",sep="-"))) %>%
+  arrange(fecha)
+
+tc_s <- tc_mensual %>%
+  filter(fecha >= FECHA_INICIO, fecha <= FECHA_FIN, !is.na(TC_digital)) %>%
+  arrange(fecha) %>%
+  mutate(log_TC = log(TC_digital),
+         var_mensual = (TC_digital/lag(TC_digital)-1)*100,
+         var_interanual = (TC_digital/lag(TC_digital,12)-1)*100)
+
+tc_analisis <- tc_s %>% filter(!is.na(var_mensual))
+
+var_ts     <- ts(tc_analisis$var_mensual,
+                 start=c(year(min(tc_analisis$fecha)), month(min(tc_analisis$fecha))), frequency=12)
+log_TC_ts  <- ts(tc_s$log_TC,
+                 start=c(year(min(tc_s$fecha)), month(min(tc_s$fecha))), frequency=12)
+dlog_TC_ts <- diff(log_TC_ts)
+
+ultimo_mes <- max(tc_s$fecha)
+meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FORECAST)
+```
+
+# Comportamiento de la Variable
+
+TC digital: media móvil diaria agregada a frecuencia mensual, desde **`r format(FECHA_INICIO,"%B %Y")`** (primer mes calendario completo con cotización real; oct-2023 se excluye por estar incompleto: 13/31 días) hasta **`r format(FECHA_FIN,"%B %Y")`** (`r nrow(tc_s)` observaciones).
+
+```{r graficos, fig.height=10}
+p1 <- tc_s %>% ggplot(aes(fecha,TC_digital)) + geom_line(color="#16a085",linewidth=0.8) +
+  geom_point(color="#16a085",size=1) + labs(title="TC digital (Bs/USD)",x=NULL,y="Bs/USD") +
+  scale_x_date(date_breaks="3 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
+
+p2 <- tc_analisis %>% ggplot(aes(fecha,var_mensual)) +
+  geom_col(fill=ifelse(tc_analisis$var_mensual>=0,"#16a085","#e74c3c"),alpha=0.7,width=20) +
+  geom_hline(yintercept=0,linewidth=0.3) +
+  labs(title="M1: Variación mensual del TC digital (%)",x=NULL,y="Var. mensual (%)") +
+  scale_x_date(date_breaks="3 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
+
+dlog_df <- data.frame(fecha=tc_s$fecha[-1], dlog=as.numeric(dlog_TC_ts))
+p3 <- dlog_df %>% ggplot(aes(fecha,dlog)) +
+  geom_col(fill=ifelse(dlog_df$dlog>=0,"#8e44ad","#e74c3c"),alpha=0.7,width=20) +
+  geom_hline(yintercept=0,linewidth=0.3) +
+  labs(title=expression("M2: "*Delta*"log(TC digital)"),x=NULL,y=expression(Delta*"log(TC)")) +
+  scale_x_date(date_breaks="3 months",date_labels="%b %Y") + theme(axis.text.x=element_text(angle=45,hjust=1))
+
+grid.arrange(p1, p2, p3, ncol=1)
+```
+
+## Base de datos consolidada
+
+```{r tabla-bd}
+tc_s %>%
+  transmute(Fecha=format(fecha,"%b %Y"), `TC digital`=round(TC_digital,4),
+            `log(TC)`=round(log_TC,4), `Var. mens.(%)`=round(var_mensual,3),
+            `Var. ia.(%)`=round(var_interanual,2), `Días con dato`=dias) %>%
+  kable(caption="Base mensual consolidada — TC digital",align="r") %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=TRUE,font_size=11) %>%
+  scroll_box(height="380px")
+```
+
+---
+
+# Identificación y Estacionariedad
+
+```{r estacionariedad, include=FALSE}
+adf_var <- adf.test(var_ts); pp_var <- pp.test(var_ts); kpss_var <- kpss.test(var_ts,null="Level")
+adf_log <- adf.test(log_TC_ts); pp_log <- pp.test(log_TC_ts); kpss_log <- kpss.test(log_TC_ts,null="Level")
+adf_dlog <- adf.test(dlog_TC_ts); pp_dlog <- pp.test(dlog_TC_ts); kpss_dlog <- kpss.test(dlog_TC_ts,null="Level")
+
+## Zivot-Andrews (quiebre estructural en el intercepto) — mismo criterio que
+## el resto del proyecto (ARIMA_Inflacion.Rmd / SARIMA_Inflacion.Rmd).
+za_lag  <- function(x) trunc((length(x)-1)^(1/3))
+za_pval <- function(stat, cval) {
+  if (stat <= cval[1]) return(0.01)
+  if (stat <= cval[2]) return(0.01 + 0.04*(stat-cval[1])/(cval[2]-cval[1]))
+  if (stat <= cval[3]) return(0.05 + 0.05*(stat-cval[2])/(cval[3]-cval[2]))
+  0.10
+}
+
+za_var  <- ur.za(var_ts,     model="intercept", lag=za_lag(var_ts))
+za_log  <- ur.za(log_TC_ts,  model="intercept", lag=za_lag(log_TC_ts))
+za_dlog <- ur.za(dlog_TC_ts, model="intercept", lag=za_lag(dlog_TC_ts))
+
+p_za_var  <- za_pval(za_var@teststat,  za_var@cval)
+p_za_log  <- za_pval(za_log@teststat,  za_log@cval)
+p_za_dlog <- za_pval(za_dlog@teststat, za_dlog@cval)
+
+brecha_var  <- tc_analisis$fecha[za_var@bpoint]
+brecha_log  <- tc_s$fecha[za_log@bpoint]
+brecha_dlog <- tc_s$fecha[-1][za_dlog@bpoint]
+```
+
+```{r tabla-raiz}
+cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
+
+data.frame(
+  Prueba=rep(c("ADF","Phillips-Perron","KPSS","Zivot-Andrews"),3),
+  Serie=c(rep("M1: Var. mensual",4),rep("M2: log(TC)",4),rep("Δlog(TC)",4)),
+  Stat=round(c(adf_var$stat,pp_var$stat,kpss_var$stat,za_var@teststat,
+               adf_log$stat,pp_log$stat,kpss_log$stat,za_log@teststat,
+               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat,za_dlog@teststat),4),
+  p=round(c(adf_var$p.value,pp_var$p.value,kpss_var$p.value,p_za_var,
+            adf_log$p.value,pp_log$p.value,kpss_log$p.value,p_za_log,
+            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value,p_za_dlog),4),
+  Conclusion=c(cn(adf_var$p.value,"adf"),cn(pp_var$p.value,"adf"),cn(kpss_var$p.value,"kpss"),cn(p_za_var,"adf"),
+               cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),cn(p_za_log,"adf"),
+               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"),cn(p_za_dlog,"adf"))
+) %>%
+  kable(col.names=c("Prueba","Serie","Estadístico","p-valor","Conclusión"),
+        caption="Pruebas de raíz unitaria",align=c("l","l","r","r","l")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE, font_size=11) %>%
+  pack_rows("M1: Variación mensual",1,4) %>% pack_rows("M2: log(TC)",5,8) %>% pack_rows("Δlog(TC)",9,12)
+```
+
+> Zivot-Andrews (quiebre en intercepto): quiebre detectado en **`r format(brecha_var,"%b %Y")`** (M1), **`r format(brecha_log,"%b %Y")`** (M2) y **`r format(brecha_dlog,"%b %Y")`** (Δlog(TC)).
+
+> **Nota de muestra:** con solo `r nrow(tc_s)` observaciones mensuales (`r format(FECHA_INICIO,"%b %Y")`–`r format(FECHA_FIN,"%b %Y")`), la identificación es más incierta que en los modelos de inflación (que usan series bastante más largas). Los resultados de este reporte deben leerse con ese margen de error en mente.
+
+```{r acf-pacf, fig.height=5}
+par(mfrow=c(2,2),mar=c(4,4,3,1))
+Acf(var_ts,lag.max=18,main="ACF — M1: Var. mensual")
+Pacf(var_ts,lag.max=18,main="PACF — M1: Var. mensual")
+Acf(dlog_TC_ts,lag.max=18,main="ACF — M2: Δlog(TC)")
+Pacf(dlog_TC_ts,lag.max=18,main="PACF — M2: Δlog(TC)")
+par(mfrow=c(1,1))
+```
+
+---
+
+# Estimación y Selección — Dos Métodos
+
+```{r estimacion, include=FALSE}
+estimar_grilla <- function(serie, max_p=MAX_P, max_q=MAX_Q) {
+  res <- data.frame()
+  for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) {
+    if(p==0&&d==0&&q==0) next
+    fit <- try(Arima(serie,order=c(p,d,q),method="ML"),silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb12 <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+      res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)",p,d,q),p=p,d=d,q=q,
+        AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
+        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        LogLik=ll,LB12=lb12,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
+    }
+  }
+  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
+    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB12)|LB12<0.05,1,0),
+    R_p=ifelse(!Raices_ok,1,0),
+    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
+}
+
+results_m1 <- estimar_grilla(var_ts)
+results_m2 <- estimar_grilla(log_TC_ts)
+mejor_m1_propio <- results_m1[1,]
+mejor_m2 <- results_m2[1,]
+
+## M1 se FUERZA a usar p y q de M2, pero con d=0 (la variacion mensual ya ES
+## la primera diferencia del log(TC); usar d=1 encima sobrediferencia) —
+## mismo criterio que ARIMA_Inflacion.Rmd.
+modelo_m2 <- Arima(log_TC_ts, order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML")
+modelo_m1 <- Arima(var_ts,    order=c(mejor_m2$p, 0,          mejor_m2$q), method="ML")
+orden_m2  <- sprintf("ARIMA(%d,%d,%d)", mejor_m2$p, mejor_m2$d, mejor_m2$q)
+orden_m1  <- sprintf("ARIMA(%d,0,%d)",  mejor_m2$p, mejor_m2$q)
+```
+
+El scoring compuesto integra: **RMSE** + **MAPE** + promedio(**AICc**, **BIC**, **Hannan-Quinn**) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
+
+## M1: Método Directo (variación mensual %)
+
+```{r tabla-m1}
+results_m1 %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,4), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("M1 Directo — Top 15 de %d modelos (variable: variación mensual %%)",nrow(results_m1)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#e74c3c") %>% column_spec(10,bold=TRUE)
+```
+
+> M1 elegiría **`r mejor_m1_propio$Modelo`** por score propio, pero se fuerza a **`r orden_m1`** (mismo AR/MA que M2, con d=0 porque la variación mensual ya es una primera diferencia del log(TC)).
+
+## M2: Método Logarítmico (log TC digital)
+
+```{r tabla-m2}
+results_m2 %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("M2 Logarítmico — Top 15 de %d modelos (variable: log TC digital)",nrow(results_m2)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
+```
+
+## Comparación (M1: `r orden_m1` vs M2: `r orden_m2`)
+
+```{r comparacion-ganadores}
+acc_m1 <- accuracy(modelo_m1); acc_m2 <- accuracy(modelo_m2)
+lb12_m1 <- Box.test(residuals(modelo_m1),lag=12,type="Ljung-Box",fitdf=length(coef(modelo_m1)))$p.value
+lb12_m2 <- Box.test(residuals(modelo_m2),lag=12,type="Ljung-Box",fitdf=length(coef(modelo_m2)))$p.value
+
+data.frame(
+  Criterio=c("Especificación forzada","AIC","BIC","AICc","Hannan-Quinn",
+             "RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
+  M1=c(orden_m1, round(AIC(modelo_m1),2), round(BIC(modelo_m1),2),
+       round(modelo_m1$aicc,2),
+       round(-2*as.numeric(logLik(modelo_m1))+2*attr(logLik(modelo_m1),"df")*log(log(modelo_m1$nobs)),2),
+       round(acc_m1[1,"RMSE"],6), round(acc_m1[1,"MAPE"],4), round(lb12_m1,4)),
+  M2=c(orden_m2, round(AIC(modelo_m2),2), round(BIC(modelo_m2),2),
+       round(modelo_m2$aicc,2),
+       round(-2*as.numeric(logLik(modelo_m2))+2*attr(logLik(modelo_m2),"df")*log(log(modelo_m2$nobs)),2),
+       round(acc_m2[1,"RMSE"],6), round(acc_m2[1,"MAPE"],4), round(lb12_m2,4))
+) %>%
+  kable(col.names=c("Criterio","M1: Directo","M2: Logarítmico"),
+        caption=sprintf("M1: %s sobre var. mensual vs M2: %s sobre log(TC)", orden_m1, orden_m2),
+        align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r diagnostico-graficos, fig.height=8}
+par(mfrow=c(2,4),mar=c(4,3,3,1))
+r1<-residuals(modelo_m1); r2<-residuals(modelo_m2)
+plot(r1,main=paste("M1:",orden_m1),ylab="Res.",col="#e74c3c"); abline(h=0,lty=2)
+hist(r1,breaks=10,prob=TRUE,main="M1: Histograma",col="#e74c3c40",border="white",xlab="")
+curve(dnorm(x,mean(r1),sd(r1)),add=TRUE,col="#e74c3c",lwd=2)
+Acf(r1,main="M1: ACF residuos",lag.max=15)
+qqnorm(r1,main="M1: Q-Q",col="#e74c3c",pch=16); qqline(r1,col="grey50",lwd=2)
+plot(r2,main=paste("M2:",orden_m2),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
+hist(r2,breaks=10,prob=TRUE,main="M2: Histograma",col="#2980b940",border="white",xlab="")
+curve(dnorm(x,mean(r2),sd(r2)),add=TRUE,col="#2980b9",lwd=2)
+Acf(r2,main="M2: ACF residuos",lag.max=15)
+qqnorm(r2,main="M2: Q-Q",col="#2980b9",pch=16); qqline(r2,col="grey50",lwd=2)
+par(mfrow=c(1,1))
+```
+
+---
+
+# Backtesting
+
+Se reservan los últimos `r H_BACKTEST` meses. M1 usa **`r orden_m1`** y M2 usa **`r orden_m2`**. Se comparan en **TC digital (niveles)**.
+
+```{r backtesting}
+n1<-length(var_ts); nt1<-n1-H_BACKTEST
+bt1<-Arima(window(var_ts,end=time(var_ts)[nt1]),order=c(mejor_m2$p,0,mejor_m2$q),method="ML")
+fc1<-forecast(bt1,h=H_BACKTEST,level=c(80,95))
+fc_var_m1 <- as.numeric(fc1$mean)
+
+n2<-length(log_TC_ts); nt2<-n2-H_BACKTEST
+bt2<-Arima(window(log_TC_ts,end=time(log_TC_ts)[nt2]),order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q),method="ML")
+fc2<-forecast(bt2,h=H_BACKTEST,level=c(80,95))
+tc_fc2 <- exp(as.numeric(fc2$mean))
+
+fechas_test <- tail(tc_s$fecha, H_BACKTEST)
+tc_obs      <- tail(tc_s$TC_digital, H_BACKTEST)
+
+## M1 pronostica variacion mensual -> se encadena a nivel de TC. tc_analisis
+## (no tc_s) es el subset correcto para indexar con nt1: tc_analisis descarta
+## la primera fila de tc_s (var_mensual=NA ahi), asi que su indice i-esimo
+## equivale al de tc_s en la posicion i+1 — indexar tc_s directamente con
+## nt1 apuntaria un mes antes del verdadero ultimo dato de entrenamiento.
+tc_pre_train <- tc_analisis$TC_digital[nt1]
+tc_fc1 <- numeric(H_BACKTEST)
+tc_fc1[1] <- tc_pre_train * (1 + fc_var_m1[1]/100)
+for (i in 2:H_BACKTEST) tc_fc1[i] <- tc_fc1[i-1] * (1 + fc_var_m1[i]/100)
+
+err1 <- tc_fc1 - tc_obs; err2 <- tc_fc2 - tc_obs
+rmse1<-sqrt(mean(err1^2)); rmse2<-sqrt(mean(err2^2))
+mape1<-mean(abs(err1/tc_obs))*100; mape2<-mean(abs(err2/tc_obs))*100
+```
+
+```{r tabla-bt}
+data.frame(Fecha=format(fechas_test,"%b %Y"), Observado=round(tc_obs,4),
+           M1_pron=round(tc_fc1,4), M1_err=round(err1,4),
+           M2_pron=round(tc_fc2,4), M2_err=round(err2,4)) %>%
+  kable(col.names=c("Fecha","Obs. (Bs/USD)","M1 pron.","M1 error","M2 pron.","M2 error"),
+        caption="Backtesting — TC digital observado vs. pronosticado",align=c("l",rep("r",5))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r metricas-bt}
+data.frame(Metrica=c("RMSE (Bs/USD)","MAPE (%)"),
+           M1=c(round(rmse1,4), paste0(round(mape1,2),"%")),
+           M2=c(round(rmse2,4), paste0(round(mape2,2),"%"))) %>%
+  kable(col.names=c("Métrica","M1: Directo","M2: Logarítmico"),
+        caption="Métricas de backtesting",align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r grafico-bt, fig.height=5}
+bt_df <- bind_rows(
+  data.frame(fecha=fechas_test, tc=tc_obs, tipo="Observado"),
+  data.frame(fecha=fechas_test, tc=tc_fc1, tipo="M1 Directo"),
+  data.frame(fecha=fechas_test, tc=tc_fc2, tipo="M2 Logarítmico"))
+
+ggplot(bt_df, aes(fecha,tc,color=tipo,linetype=tipo)) +
+  geom_line(linewidth=0.9) + geom_point(size=2.5) +
+  scale_color_manual(values=c(Observado="#2c3e50",`M1 Directo`="#e74c3c",`M2 Logarítmico`="#2980b9")) +
+  scale_linetype_manual(values=c(Observado="solid",`M1 Directo`="dashed",`M2 Logarítmico`="dashed")) +
+  labs(title=sprintf("Backtesting TC digital — M1:%s vs M2:%s",orden_m1,orden_m2),
+       subtitle=sprintf("M1 RMSE=%.4f | M2 RMSE=%.4f",rmse1,rmse2),
+       x=NULL,y="TC digital (Bs/USD)",color=NULL,linetype=NULL) +
+  scale_x_date(date_breaks="1 month",date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+# Pronóstico Final
+
+```{r pronostico}
+fc_f1<-forecast(modelo_m1,h=H_FORECAST,level=c(80,95))
+var_mens_m1 <- as.numeric(fc_f1$mean)
+ult_tc<-tail(tc_s$TC_digital,1)
+tp1<-numeric(H_FORECAST); tp1[1]<-ult_tc*(1+var_mens_m1[1]/100)
+for(i in 2:H_FORECAST) tp1[i]<-tp1[i-1]*(1+var_mens_m1[i]/100)
+
+fc_f2<-forecast(modelo_m2,h=H_FORECAST,level=c(80,95))
+tp2<-exp(as.numeric(fc_f2$mean))
+tp2_lo95<-exp(as.numeric(fc_f2$lower[,2])); tp2_hi95<-exp(as.numeric(fc_f2$upper[,2]))
+tp2_lo80<-exp(as.numeric(fc_f2$lower[,1])); tp2_hi80<-exp(as.numeric(fc_f2$upper[,1]))
+var_mens_m2 <- numeric(H_FORECAST)
+var_mens_m2[1] <- (tp2[1]/ult_tc - 1)*100
+for(i in 2:H_FORECAST) var_mens_m2[i] <- (tp2[i]/tp2[i-1] - 1)*100
+```
+
+## Proyección comparada — TC digital
+
+```{r tabla-proy}
+mn<-c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre")
+data.frame(Mes=mn[month(meses_pron)],
+           M1_TC=round(tp1,4), M2_TC=round(tp2,4),
+           M1_var=round(var_mens_m1,3), M2_var=round(var_mens_m2,3)) %>%
+  kable(col.names=c("Mes","M1 TC digital","M2 TC digital","M1 var. mensual (%)","M2 var. mensual (%)"),
+        caption=sprintf("Proyección de TC digital — M1: %s vs M2: %s",orden_m1,orden_m2),
+        align=c("l",rep("r",4))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+## Fan chart — M2 (log-normal) con referencia M1
+
+```{r fan-chart, fig.height=5}
+tc_obs_df <- tc_s %>% select(fecha, TC_digital)
+ci_fan <- data.frame(fecha=meses_pron, lo80=tp2_lo80, hi80=tp2_hi80, lo95=tp2_lo95, hi95=tp2_hi95)
+
+pto_enlace <- tail(tc_obs_df, 1)
+m1_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), TC=c(pto_enlace$TC_digital, tp1))
+m2_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron), TC=c(pto_enlace$TC_digital, tp2))
+
+ggplot() +
+  geom_ribbon(data=ci_fan, aes(fecha, ymin=lo95, ymax=hi95), fill="#2980b9", alpha=0.10) +
+  geom_ribbon(data=ci_fan, aes(fecha, ymin=lo80, ymax=hi80), fill="#2980b9", alpha=0.22) +
+  geom_line(data=tc_obs_df, aes(fecha, TC_digital), color="#2c3e50", linewidth=0.9) +
+  geom_line(data=m2_linea, aes(fecha, TC), color="blue", linewidth=0.9) +
+  geom_line(data=m1_linea, aes(fecha, TC), color="#e74c3c", linewidth=0.9, linetype="dashed") +
+  labs(title="TC digital proyectado — M1 (rojo) vs M2 (azul)",
+       subtitle=sprintf("M1: %s | M2: %s", orden_m1, orden_m2),
+       x=NULL, y="TC digital (Bs/USD)") +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+<center>
+*Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces.*
+*M1: `r orden_m1` sobre var. mensual (d=0) | M2: `r orden_m2` sobre log(TC) (d=1). Mismo AR/MA, diferenciación equivalente.*
+*Muestra: `r format(FECHA_INICIO,"%b %Y")`–`r format(FECHA_FIN,"%b %Y")` (n=`r nrow(tc_s)`) — sin regresores exógenos; ver ARIMAX_TC.Rmd para el modelo con inflación interanual como predictor.*
+</center>

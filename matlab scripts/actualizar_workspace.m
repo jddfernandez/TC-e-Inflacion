@@ -84,7 +84,11 @@ dig  = safe_dbl(T_tc{:,4});
 ofic = safe_dbl(T_tc{:,5});
 ref  = safe_dbl(T_tc{:,6});
 
-valid_tc = ~isnat(fechas_tc) & ~isnan(pref);
+% Solo se exige fecha valida: TC PREFERENCIAL puede faltar en filas nuevas
+% (p.ej. actualizaciones parciales desde un CSV que solo trae oficial/digital);
+% exigir pref no-NaN aqui las descartaba silenciosamente aunque tuvieran
+% TC-DIGITAL/TC-OFICIAL validos.
+valid_tc = ~isnat(fechas_tc);
 BDBruta_TC = timetable(fechas_tc(valid_tc), pref(valid_tc), dig(valid_tc), ...
     ofic(valid_tc), ref(valid_tc), ...
     'VariableNames', {'TC_PREFERENCIAL','TC_DIGITAL','TC_OFICIAL','TC_REFERENCIAL'});

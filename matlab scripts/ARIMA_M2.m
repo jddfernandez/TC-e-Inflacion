@@ -74,13 +74,13 @@ fprintf('  ZA: H1 = estacionaria con un quiebre estructural unico en fecha desco
 [~, p_kpss_dlog] = kpsstest(dlogIPC);
 
 % --- Zivot-Andrews (zatest.m) ---
-% Modelo 'ARD' = quiebre en intercepto y tendencia (caso mas general).
+% Modelo 'LS' = quiebre en intercepto unicamente.
 
 za_ok = false;
 
 try
-    [h_za_log,  p_za_log,  stat_za_log,  cv_za_log,  bd_log]  = zatest(logIPC,  'Model','ARD');
-    [h_za_dlog, p_za_dlog, stat_za_dlog, cv_za_dlog, bd_dlog] = zatest(dlogIPC, 'Model','ARD');
+    [h_za_log,  p_za_log,  stat_za_log,  cv_za_log,  bd_log]  = zatest(logIPC,  'Model','LS');
+    [h_za_dlog, p_za_dlog, stat_za_dlog, cv_za_dlog, bd_dlog] = zatest(dlogIPC, 'Model','LS');
 
     za_ok = true;
 
@@ -131,7 +131,7 @@ if za_ok
         fprintf('  Fecha de quiebre: log(IPC) = %-10s  |  Dlog(IPC) = %s\n', ...
             datestr(fd_log,'mmm yyyy'), datestr(fd_dlog,'mmm yyyy'));
 
-        fprintf('  CV 5%% (modelo ARD): log(IPC)=%.3f | Dlog(IPC)=%.3f\n', ...
+        fprintf('  CV 5%% (modelo LS, quiebre en intercepto): log(IPC)=%.3f | Dlog(IPC)=%.3f\n', ...
             cv_za_log, cv_za_dlog);
     catch
     end

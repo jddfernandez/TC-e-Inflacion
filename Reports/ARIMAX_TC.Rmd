@@ -1,0 +1,461 @@
+
+---
+title: "Proyección del Tipo de Cambio Digital en Bolivia"
+subtitle: "Modelo ARIMAX — Inflación Interanual como Regresor Exógeno"
+author: "Análisis Econométrico"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: { collapsed: false }
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: kable
+---
+
+<style>
+.title,.subtitle,.author,.date { text-align:center; }
+.subtitle { font-size:18px; color:#7f8c8d; font-style:italic; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
+  fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
+
+required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra")
+new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
+if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
+
+library(readxl);library(dplyr);library(lubridate);library(ggplot2)
+library(forecast);library(tseries);library(urca);library(lmtest)
+library(kableExtra);library(scales);library(gridExtra)
+
+tema <- theme_minimal(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
+        plot.subtitle=element_text(hjust=0.5,color="grey40",size=10),
+        panel.grid.minor=element_blank(), legend.position="bottom")
+theme_set(tema)
+
+RUTA_BD <- "../Inputs/BD Bruta.xlsx"
+FECHA_INICIO <- as.Date("2023-11-01")
+FECHA_FIN    <- as.Date("2026-06-01")
+H_BACKTEST  <- 6
+H_FORECAST  <- 7
+MAX_P <- 4
+MAX_Q <- 4
+```
+
+```{r carga, include=FALSE}
+meses_map <- c("Enero"=1,"Febrero"=2,"Marzo"=3,"Abril"=4,"Mayo"=5,
+               "Junio"=6,"Julio"=7,"Agosto"=8,"Septiembre"=9,
+               "Octubre"=10,"Noviembre"=11,"Diciembre"=12)
+
+ipc_raw <- read_excel(RUTA_BD, sheet="IPC")
+ipc <- ipc_raw %>%
+  mutate(Valor_num=suppressWarnings(as.numeric(Valor))) %>% filter(!is.na(Valor_num)) %>%
+  mutate(mes_num=meses_map[Mes], fecha=as.Date(paste(`Año`,mes_num,"01",sep="-")), IPC=Valor_num) %>%
+  arrange(fecha) %>% select(fecha,`Año`,Mes,mes_num,IPC) %>%
+  mutate(inf_interanual=(IPC/lag(IPC,12)-1)*100)
+
+tc_raw <- read_excel(RUTA_BD, sheet="TC"); names(tc_raw) <- trimws(names(tc_raw))
+tc_mensual <- tc_raw %>%
+  mutate(fecha_date=as.Date(fecha), anio=year(fecha_date), mes=month(fecha_date)) %>%
+  group_by(anio, mes) %>%
+  summarise(TC_digital=mean(`TC-DIGITAL`,na.rm=TRUE), .groups="drop") %>%
+  mutate(fecha=as.Date(paste(anio,mes,"01",sep="-")))
+
+tc_s <- tc_mensual %>%
+  filter(fecha >= FECHA_INICIO, fecha <= FECHA_FIN, !is.na(TC_digital)) %>%
+  arrange(fecha)
+
+log_TC_ts <- ts(log(tc_s$TC_digital),
+                start=c(year(min(tc_s$fecha)), month(min(tc_s$fecha))), frequency=12)
+
+ultimo_mes <- max(tc_s$fecha)
+meses_pron <- seq.Date(ultimo_mes %m+% months(1), by="month", length.out=H_FORECAST)
+
+## Inflacion interanual — ya disponible sin NAs para toda la ventana del TC
+## digital (IPC tiene historia desde 2018).
+infl_merge <- tc_s %>% select(fecha) %>%
+  left_join(ipc %>% select(fecha, inf_interanual), by="fecha")
+xreg_ia <- cbind(Inf_ia = infl_merge$inf_interanual)
+```
+
+# Motivación
+
+Espejo exacto de `ARIMAX_Inflacion.Rmd`, con los roles invertidos: aquí el **TC digital** es la variable a explicar, y la **inflación interanual** es el regresor exógeno. Se estima un ARIMA(p,d,q) base (sin exógena) y un ARIMAX(p,d,q)+inflación en paralelo sobre log(TC digital), y el backtesting decide cuál se usa para el pronóstico final — mismo criterio que el resto de la batería.
+
+> **Nota de muestra:** el TC digital solo cotiza realmente desde oct-2023; se usa la ventana de meses completos `r format(FECHA_INICIO,"%B %Y")`–`r format(FECHA_FIN,"%B %Y")` (n=`r length(log_TC_ts)`), bastante más corta que la de los modelos de inflación.
+
+---
+
+# Datos: TC Digital e Inflación Interanual
+
+```{r graficos-datos, fig.height=8}
+p1 <- tc_s %>% ggplot(aes(fecha, TC_digital)) +
+  geom_line(color="#16a085", linewidth=0.8) + geom_point(color="#16a085", size=1) +
+  labs(title="TC digital (Bs/USD)", x=NULL, y="Bs/USD") +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+
+p2 <- infl_merge %>% ggplot(aes(fecha, inf_interanual)) +
+  geom_line(color="#c0392b", linewidth=0.8) + geom_point(color="#c0392b", size=1) +
+  labs(title="Inflación interanual (%)", x=NULL, y="% interanual") +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+```{r correlacion, fig.height=4.5}
+cor_lvl <- cor(log(tc_s$TC_digital), infl_merge$inf_interanual, use="complete.obs")
+
+ggplot(data.frame(ia=infl_merge$inf_interanual, log_tc=log(tc_s$TC_digital)), aes(ia, log_tc)) +
+  geom_point(color="#8e44ad", size=1.8, alpha=0.7) +
+  geom_smooth(method="lm", se=TRUE, color="#2c3e50", linewidth=0.7) +
+  labs(title=sprintf("log(TC digital) vs. inflación interanual (r = %.3f)", cor_lvl),
+       x="Inflación interanual (%)", y="log(TC digital)")
+```
+
+> Correlación en niveles: **r = `r round(cor_lvl,3)`**. Igual que en el reporte espejo, una correlación en niveles no implica relación causal ni predictiva de corto plazo — de ahí el backtesting.
+
+---
+
+# Identificación y Estacionariedad
+
+```{r estacionariedad, include=FALSE}
+dlog_TC_ts <- diff(log_TC_ts)
+adf_log <- adf.test(log_TC_ts); pp_log <- pp.test(log_TC_ts); kpss_log <- kpss.test(log_TC_ts,null="Level")
+adf_dlog <- adf.test(dlog_TC_ts); pp_dlog <- pp.test(dlog_TC_ts); kpss_dlog <- kpss.test(dlog_TC_ts,null="Level")
+adf_ia  <- adf.test(infl_merge$inf_interanual); kpss_ia <- kpss.test(infl_merge$inf_interanual, null="Level")
+
+za_lag  <- function(x) trunc((length(x)-1)^(1/3))
+za_pval <- function(stat, cval) {
+  if (stat <= cval[1]) return(0.01)
+  if (stat <= cval[2]) return(0.01 + 0.04*(stat-cval[1])/(cval[2]-cval[1]))
+  if (stat <= cval[3]) return(0.05 + 0.05*(stat-cval[2])/(cval[3]-cval[2]))
+  0.10
+}
+
+za_log  <- ur.za(log_TC_ts,  model="intercept", lag=za_lag(log_TC_ts))
+za_dlog <- ur.za(dlog_TC_ts, model="intercept", lag=za_lag(dlog_TC_ts))
+p_za_log  <- za_pval(za_log@teststat,  za_log@cval)
+p_za_dlog <- za_pval(za_dlog@teststat, za_dlog@cval)
+brecha_log  <- tc_s$fecha[za_log@bpoint]
+brecha_dlog <- tc_s$fecha[-1][za_dlog@bpoint]
+```
+
+```{r tabla-raiz}
+cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
+
+data.frame(
+  Prueba=c("ADF","Phillips-Perron","KPSS","Zivot-Andrews","ADF","Phillips-Perron","KPSS","Zivot-Andrews","ADF","KPSS"),
+  Serie=c(rep("log(TC digital)",4), rep("Δlog(TC)",4), rep("Inflación ia",2)),
+  Stat=round(c(adf_log$stat,pp_log$stat,kpss_log$stat,za_log@teststat,
+               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat,za_dlog@teststat,
+               adf_ia$statistic, kpss_ia$statistic),4),
+  p=round(c(adf_log$p.value,pp_log$p.value,kpss_log$p.value,p_za_log,
+            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value,p_za_dlog,
+            adf_ia$p.value, kpss_ia$p.value),4),
+  Conclusion=c(cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),cn(p_za_log,"adf"),
+               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"),cn(p_za_dlog,"adf"),
+               cn(adf_ia$p.value,"adf"),cn(kpss_ia$p.value,"kpss"))
+) %>%
+  kable(col.names=c("Prueba","Serie","Estadístico","p-valor","Conclusión"),
+        caption="Pruebas de raíz unitaria", align=c("l","l","r","r","l")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE, font_size=11) %>%
+  pack_rows("log(TC digital)",1,4) %>% pack_rows("Δlog(TC)",5,8) %>% pack_rows("Inflación interanual (regresor)",9,10)
+```
+
+> Zivot-Andrews: quiebre en **`r format(brecha_log,"%b %Y")`** (log(TC)) y **`r format(brecha_dlog,"%b %Y")`** (Δlog(TC)). Igual que en el reporte espejo, la inflación como regresor se maneja vía regresión con errores ARMA, no como cointegración formal.
+
+```{r acf-pacf, fig.height=5}
+par(mfrow=c(1,2),mar=c(4,4,3,1))
+Acf(dlog_TC_ts, lag.max=18, main="ACF — Δlog(TC digital)")
+Pacf(dlog_TC_ts, lag.max=18, main="PACF — Δlog(TC digital)")
+par(mfrow=c(1,1))
+```
+
+---
+
+# Estimación y Selección — ARIMA base vs. ARIMAX
+
+```{r estimacion, include=FALSE}
+estimar_grilla <- function(serie, xreg=NULL, max_p=MAX_P, max_q=MAX_Q) {
+  res <- data.frame()
+  for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) {
+    if(p==0&&d==0&&q==0) next
+    fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML"), silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb12 <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+      res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)",p,d,q),p=p,d=d,q=q,
+        AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
+        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        LogLik=ll,LB12=lb12,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
+    }
+  }
+  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
+    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB12)|LB12<0.05,1,0),
+    R_p=ifelse(!Raices_ok,1,0),
+    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
+}
+
+results_base  <- estimar_grilla(log_TC_ts)
+results_arimax <- estimar_grilla(log_TC_ts, xreg=xreg_ia)
+
+mejor_base   <- results_base[1,]
+mejor_arimax <- results_arimax[1,]
+
+modelo_base   <- Arima(log_TC_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML")
+modelo_arimax <- Arima(log_TC_ts, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
+                       xreg=xreg_ia, method="ML")
+
+orden_base   <- sprintf("ARIMA(%d,%d,%d)", mejor_base$p, mejor_base$d, mejor_base$q)
+orden_arimax <- sprintf("ARIMA(%d,%d,%d)+Inf_ia", mejor_arimax$p, mejor_arimax$d, mejor_arimax$q)
+
+coefs_arimax <- coef(modelo_arimax); se_arimax <- sqrt(diag(vcov(modelo_arimax)))
+pv_arimax <- 2*(1-pnorm(abs(coefs_arimax/se_arimax)))
+idx_ia  <- which(names(coefs_arimax) == "Inf_ia")
+ia_sig  <- length(idx_ia) > 0 && !is.na(pv_arimax[idx_ia]) && pv_arimax[idx_ia] < 0.05
+```
+
+Ambas grillas recorren $p,q \in [0,`r MAX_P`]$, $d \in \{0,1\}$ sobre **log(TC digital)**; la única diferencia es la presencia del regresor `Inf_ia` (inflación interanual).
+
+## ARIMA base (sin exógena)
+
+```{r tabla-base}
+results_base %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("ARIMA base — Top 15 de %d modelos (log TC digital, sin regresor)",nrow(results_base)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#2980b9")
+```
+
+> **Ganador:** `r orden_base` (Score = `r round(mejor_base$Score,3)`)
+
+## ARIMAX (+ inflación interanual)
+
+```{r tabla-arimax}
+results_arimax %>% head(15) %>%
+  transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
+            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
+  kable(caption=sprintf("ARIMAX — Top 15 de %d modelos (log TC digital + inflación interanual)",nrow(results_arimax)),
+        align=c("l","c",rep("r",7),"c","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
+  row_spec(1,bold=TRUE,color="white",background="#8e44ad")
+```
+
+> **Ganador:** `r orden_arimax` (Score = `r round(mejor_arimax$Score,3)`)
+
+```{r coef-ia}
+data.frame(
+  Variable = names(coefs_arimax)[idx_ia],
+  Coeficiente = round(coefs_arimax[idx_ia], 5),
+  `Err. Std.` = round(se_arimax[idx_ia], 5),
+  z = round(coefs_arimax[idx_ia]/se_arimax[idx_ia], 3),
+  `p-valor` = round(pv_arimax[idx_ia], 4),
+  check.names = FALSE
+) %>%
+  kable(caption="Coeficiente del regresor exógeno (inflación interanual) en el ARIMAX ganador",
+        align=c("l","r","r","r","r"), row.names=FALSE) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+> `r if (ia_sig) "El coeficiente de la inflación interanual es significativo al 5%," else "El coeficiente de la inflación interanual NO es significativo al 5%,"` por lo que la elección final entre ARIMA base y ARIMAX se decide con el **backtesting** (siguiente sección), no con el ajuste dentro de muestra.
+
+## Comparación dentro de muestra
+
+```{r comparacion}
+acc_base <- accuracy(modelo_base); acc_arimax <- accuracy(modelo_arimax)
+lb12_base   <- Box.test(residuals(modelo_base),  lag=12,type="Ljung-Box",fitdf=length(coef(modelo_base)))$p.value
+lb12_arimax <- Box.test(residuals(modelo_arimax),lag=12,type="Ljung-Box",fitdf=length(coef(modelo_arimax)))$p.value
+
+data.frame(
+  Criterio=c("Especificación","AIC","BIC","AICc","Hannan-Quinn","RMSE (train)","MAPE (train)","Ljung-Box h=12 (p)"),
+  Base=c(orden_base, round(AIC(modelo_base),2), round(BIC(modelo_base),2), round(modelo_base$aicc,2),
+         round(-2*as.numeric(logLik(modelo_base))+2*attr(logLik(modelo_base),"df")*log(log(modelo_base$nobs)),2),
+         round(acc_base[1,"RMSE"],6), round(acc_base[1,"MAPE"],4), round(lb12_base,4)),
+  ARIMAX=c(orden_arimax, round(AIC(modelo_arimax),2), round(BIC(modelo_arimax),2), round(modelo_arimax$aicc,2),
+           round(-2*as.numeric(logLik(modelo_arimax))+2*attr(logLik(modelo_arimax),"df")*log(log(modelo_arimax$nobs)),2),
+           round(acc_arimax[1,"RMSE"],6), round(acc_arimax[1,"MAPE"],4), round(lb12_arimax,4))
+) %>%
+  kable(col.names=c("Criterio","Base","ARIMAX"),
+        caption=sprintf("Base: %s vs ARIMAX: %s", orden_base, orden_arimax),
+        align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r diagnostico-graficos, fig.height=8}
+par(mfrow=c(2,4),mar=c(4,3,3,1))
+r1<-residuals(modelo_base); r2<-residuals(modelo_arimax)
+plot(r1,main=paste("Base:",orden_base),ylab="Res.",col="#2980b9"); abline(h=0,lty=2)
+hist(r1,breaks=10,prob=TRUE,main="Base: Histograma",col="#2980b940",border="white",xlab="")
+curve(dnorm(x,mean(r1),sd(r1)),add=TRUE,col="#2980b9",lwd=2)
+Acf(r1,main="Base: ACF residuos",lag.max=15)
+qqnorm(r1,main="Base: Q-Q",col="#2980b9",pch=16); qqline(r1,col="grey50",lwd=2)
+plot(r2,main=paste("ARIMAX:",orden_arimax),ylab="Res.",col="#8e44ad"); abline(h=0,lty=2)
+hist(r2,breaks=10,prob=TRUE,main="ARIMAX: Histograma",col="#8e44ad40",border="white",xlab="")
+curve(dnorm(x,mean(r2),sd(r2)),add=TRUE,col="#8e44ad",lwd=2)
+Acf(r2,main="ARIMAX: ACF residuos",lag.max=15)
+qqnorm(r2,main="ARIMAX: Q-Q",col="#8e44ad",pch=16); qqline(r2,col="grey50",lwd=2)
+par(mfrow=c(1,1))
+```
+
+---
+
+# Backtesting
+
+Se reservan los últimos `r H_BACKTEST` meses; ambos modelos se re-estiman solo con datos de entrenamiento y se comparan en **niveles de TC digital**. Para el ARIMAX se usa la inflación interanual efectivamente observada en esos meses. **Este es el criterio decisivo** para elegir el modelo final.
+
+```{r backtesting}
+n <- length(log_TC_ts); nt <- n - H_BACKTEST
+train_ts    <- window(log_TC_ts, end=time(log_TC_ts)[nt])
+fechas_test <- tail(tc_s$fecha, H_BACKTEST)
+tc_obs      <- tail(tc_s$TC_digital, H_BACKTEST)
+
+xreg_tr <- xreg_ia[1:nt, , drop=FALSE]
+xreg_te <- xreg_ia[(nt+1):n, , drop=FALSE]
+
+bt_base   <- Arima(train_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML")
+fc_base   <- forecast(bt_base, h=H_BACKTEST, level=c(80,95))
+tc_base_bt <- exp(as.numeric(fc_base$mean))
+
+bt_arimax <- Arima(train_ts, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
+                   xreg=xreg_tr, method="ML")
+fc_arimax <- forecast(bt_arimax, h=H_BACKTEST, xreg=xreg_te, level=c(80,95))
+tc_arimax_bt <- exp(as.numeric(fc_arimax$mean))
+
+rmse_f <- function(obs,pred) sqrt(mean((pred-obs)^2))
+mape_f <- function(obs,pred) mean(abs((pred-obs)/obs))*100
+
+rmse_base   <- rmse_f(tc_obs, tc_base_bt);   mape_base   <- mape_f(tc_obs, tc_base_bt)
+rmse_arimax <- rmse_f(tc_obs, tc_arimax_bt); mape_arimax <- mape_f(tc_obs, tc_arimax_bt)
+
+gana_arimax    <- rmse_arimax < rmse_base
+modelo_final   <- if (gana_arimax) modelo_arimax else modelo_base
+orden_final    <- if (gana_arimax) orden_arimax  else orden_base
+etiqueta_final <- if (gana_arimax) "ARIMAX (+inflación)" else "ARIMA base (sin exógena)"
+```
+
+```{r tabla-bt}
+data.frame(Fecha=format(fechas_test,"%b %Y"), TC_obs=round(tc_obs,4),
+           Base=round(tc_base_bt,4), ARIMAX=round(tc_arimax_bt,4),
+           Err_Base=round(tc_base_bt-tc_obs,4), Err_ARIMAX=round(tc_arimax_bt-tc_obs,4)) %>%
+  kable(col.names=c("Fecha","TC obs.","Base pron.","ARIMAX pron.","Err. Base","Err. ARIMAX"),
+        caption="Backtesting — TC digital observado vs. pronosticado", align=c("l",rep("r",5))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r metricas-bt}
+data.frame(Metrica=c("RMSE (TC)","MAPE (%)"),
+           Base=c(round(rmse_base,4), paste0(round(mape_base,2),"%")),
+           ARIMAX=c(round(rmse_arimax,4), paste0(round(mape_arimax,2),"%"))) %>%
+  kable(col.names=c("Métrica","ARIMA base","ARIMAX"),
+        caption="Métricas de backtesting comparadas",align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r grafico-bt, fig.height=5}
+hist_bt <- tc_s %>% filter(fecha < fechas_test[1]) %>% mutate(modelo="Historico") %>%
+  select(fecha,TC_digital,modelo) %>% rename(TC=TC_digital)
+bt_df <- bind_rows(
+  hist_bt,
+  data.frame(fecha=fechas_test, TC=tc_obs,       modelo="Observado"),
+  data.frame(fecha=fechas_test, TC=tc_base_bt,   modelo="ARIMA base"),
+  data.frame(fecha=fechas_test, TC=tc_arimax_bt, modelo="ARIMAX"))
+
+ggplot(bt_df, aes(fecha,TC,color=modelo)) +
+  geom_line(linewidth=0.9) + geom_point(size=1.6) +
+  scale_color_manual(values=c(Historico="grey70", Observado="#2c3e50",
+                              `ARIMA base`="#2980b9", ARIMAX="#8e44ad")) +
+  labs(title="Backtesting TC digital — ARIMA base vs. ARIMAX",
+       subtitle=sprintf("RMSE: Base=%.4f (MAPE %.2f%%) | ARIMAX=%.4f (MAPE %.2f%%)",
+                        rmse_base, mape_base, rmse_arimax, mape_arimax),
+       x=NULL, y="TC digital (Bs/USD)", color=NULL) +
+  scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+> **Modelo elegido: `r etiqueta_final` (`r orden_final`).** RMSE fuera de muestra: Base = `r round(rmse_base,4)` vs ARIMAX = `r round(rmse_arimax,4)` (MAPE: `r round(mape_base,2)`% vs `r round(mape_arimax,2)`%). `r if (gana_arimax) "La inflación interanual mejora la capacidad predictiva fuera de muestra, así que el pronóstico final usa el ARIMAX." else "La inflación interanual no mejora el desempeño fuera de muestra frente al ARIMA base. Por eso el pronóstico final usa el ARIMA base, y el ARIMAX queda como escenario exploratorio / sensibilidad a la inflación."`
+
+---
+
+# Pronóstico Final
+
+```{r pronostico}
+## Inflacion futura: se mantiene constante en el ultimo valor observado
+## (mismo criterio que el reporte espejo usa para el TC digital futuro).
+xreg_fut <- matrix(rep(tail(infl_merge$inf_interanual,1), H_FORECAST), ncol=1,
+                   dimnames=list(NULL,"Inf_ia"))
+
+fc_base_f   <- forecast(modelo_base,   h=H_FORECAST, level=c(80,95))
+fc_arimax_f <- forecast(modelo_arimax, h=H_FORECAST, xreg=xreg_fut, level=c(80,95))
+
+tc_proy_base   <- exp(as.numeric(fc_base_f$mean))
+tc_proy_arimax <- exp(as.numeric(fc_arimax_f$mean))
+
+fc_final        <- if (gana_arimax) fc_arimax_f   else fc_base_f
+tc_proy_final   <- if (gana_arimax) tc_proy_arimax else tc_proy_base
+tc_lo95_final   <- exp(as.numeric(fc_final$lower[,2])); tc_hi95_final <- exp(as.numeric(fc_final$upper[,2]))
+tc_lo80_final   <- exp(as.numeric(fc_final$lower[,1])); tc_hi80_final <- exp(as.numeric(fc_final$upper[,1]))
+```
+
+## Proyección comparada
+
+```{r tabla-proy}
+mn<-c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre")
+data.frame(Mes=mn[month(meses_pron)],
+           Base=round(tc_proy_base,4), ARIMAX=round(tc_proy_arimax,4)) %>%
+  kable(col.names=c("Mes","Base (TC digital)","ARIMAX (TC digital)"),
+        caption=sprintf("Proyección de TC digital — Base: %s vs ARIMAX: %s", orden_base, orden_arimax),
+        align=c("l",rep("r",2))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+## Fan chart — modelo elegido (`r etiqueta_final`)
+
+```{r fan-chart, fig.height=5}
+tc_obs_df <- tc_s %>% select(fecha, TC_digital)
+ci_fan <- data.frame(fecha=meses_pron, lo80=tc_lo80_final, hi80=tc_hi80_final,
+                     lo95=tc_lo95_final, hi95=tc_hi95_final)
+
+pto_enlace <- tail(tc_obs_df, 1)
+final_linea <- data.frame(fecha=c(pto_enlace$fecha, meses_pron),
+                          TC=c(pto_enlace$TC_digital,   tc_proy_final))
+otro_proy   <- if (gana_arimax) tc_proy_base else tc_proy_arimax
+otro_linea  <- data.frame(fecha=c(pto_enlace$fecha, meses_pron),
+                          TC=c(pto_enlace$TC_digital,   otro_proy))
+otro_nombre <- if (gana_arimax) "ARIMA base" else "ARIMAX"
+
+ggplot() +
+  geom_ribbon(data=ci_fan, aes(fecha, ymin=lo95, ymax=hi95), fill="#8e44ad", alpha=0.10) +
+  geom_ribbon(data=ci_fan, aes(fecha, ymin=lo80, ymax=hi80), fill="#8e44ad", alpha=0.22) +
+  geom_line(data=tc_obs_df, aes(fecha, TC_digital), color="#2c3e50", linewidth=0.9) +
+  geom_line(data=final_linea, aes(fecha, TC), color="#8e44ad", linewidth=0.9) +
+  geom_line(data=otro_linea, aes(fecha, TC), color="#e74c3c", linewidth=0.9, linetype="dashed") +
+  labs(title=sprintf("TC digital proyectado — %s (elegido) vs %s (referencia)", etiqueta_final, otro_nombre),
+       subtitle=sprintf("Elegido: %s", orden_final), x=NULL, y="TC digital (Bs/USD)") +
+  scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+---
+
+<center>
+*Modelos estimados sobre log(TC digital) desde `r format(FECHA_INICIO,"%b %Y")` (n=`r length(log_TC_ts)`). Regresor exógeno: inflación interanual.*
+*Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces — usado solo para elegir el mejor (p,d,q) dentro de cada familia.*
+*La elección entre ARIMA base y ARIMAX es por backtesting (fuera de muestra): modelo final = **`r orden_final`** (`r etiqueta_final`).*
+</center>

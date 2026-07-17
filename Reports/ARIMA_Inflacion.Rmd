@@ -39,7 +39,7 @@ tema <- theme_minimal(base_size=12) +
         panel.grid.minor=element_blank(), legend.position="bottom")
 theme_set(tema)
 
-RUTA_BD <- "Inputs/BD Bruta.xlsx"; ANIO_INICIO <- 2023
+RUTA_BD <- "../Inputs/BD Bruta.xlsx"; ANIO_INICIO <- 2023
 H_BACKTEST <- 6; H_FORECAST <- 7; MAX_P <- 4; MAX_Q <- 4
 ```
 
@@ -116,31 +116,59 @@ bd_mensual %>%
 adf_inf <- adf.test(inf_ts); pp_inf <- pp.test(inf_ts); kpss_inf <- kpss.test(inf_ts,null="Level")
 adf_log <- adf.test(log_ipc_ts); pp_log <- pp.test(log_ipc_ts); kpss_log <- kpss.test(log_ipc_ts,null="Level")
 adf_dlog <- adf.test(dlog_ipc_ts); pp_dlog <- pp.test(dlog_ipc_ts); kpss_dlog <- kpss.test(dlog_ipc_ts,null="Level")
+
+## Zivot-Andrews (quiebre estructural en el intercepto) — mismo modelo ('LS'/
+## intercept) usado en los scripts MATLAB (ARIMA_M2.m / SARIMA_M2.m).
+## urca::ur.za() no devuelve p-valor directo; se interpola contra sus valores
+## críticos (1/5/10%), igual que la función zatest.m usada en MATLAB.
+za_lag  <- function(x) trunc((length(x)-1)^(1/3))
+za_pval <- function(stat, cval) {
+  if (stat <= cval[1]) return(0.01)
+  if (stat <= cval[2]) return(0.01 + 0.04*(stat-cval[1])/(cval[2]-cval[1]))
+  if (stat <= cval[3]) return(0.05 + 0.05*(stat-cval[2])/(cval[3]-cval[2]))
+  0.10
+}
+
+za_inf  <- ur.za(inf_ts,      model="intercept", lag=za_lag(inf_ts))
+za_log  <- ur.za(log_ipc_ts,  model="intercept", lag=za_lag(log_ipc_ts))
+za_dlog <- ur.za(dlog_ipc_ts, model="intercept", lag=za_lag(dlog_ipc_ts))
+
+p_za_inf  <- za_pval(za_inf@teststat,  za_inf@cval)
+p_za_log  <- za_pval(za_log@teststat,  za_log@cval)
+p_za_dlog <- za_pval(za_dlog@teststat, za_dlog@cval)
+
+brecha_inf  <- ipc_analisis$fecha[za_inf@bpoint]
+brecha_log  <- ipc_log$fecha[za_log@bpoint]
+brecha_dlog <- ipc_log$fecha[-1][za_dlog@bpoint]
 ```
 
 ```{r tabla-raiz}
 cn <- function(p,t) if(t=="kpss") ifelse(p<0.05,"No estac.","Estac.") else ifelse(p<0.05,"Estac.","No estac.")
 
 data.frame(
-  Prueba=rep(c("ADF","Phillips-Perron","KPSS"),3),
+  Prueba=rep(c("ADF","Phillips-Perron","KPSS","Zivot-Andrews"),3),
   H0=rep(c("Raíz unitaria (no estacionaria)","Raíz unitaria (no estacionaria)",
-            "Serie estacionaria"), 3),
+            "Serie estacionaria","Raíz unitaria (sin quiebre)"), 3),
   Rechazo=rep(c("p < 0.05 → Estacionaria","p < 0.05 → Estacionaria",
-                 "p < 0.05 → No estacionaria"), 3),
-  Serie=c(rep("Inf. mensual (M1)",3),rep("log(IPC) (M2)",3),rep("Δlog(IPC)",3)),
-  Stat=round(c(adf_inf$stat,pp_inf$stat,kpss_inf$stat,adf_log$stat,pp_log$stat,kpss_log$stat,
-               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat),4),
-  p=round(c(adf_inf$p.value,pp_inf$p.value,kpss_inf$p.value,adf_log$p.value,pp_log$p.value,kpss_log$p.value,
-            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value),4),
-  Conclusion=c(cn(adf_inf$p.value,"adf"),cn(pp_inf$p.value,"adf"),cn(kpss_inf$p.value,"kpss"),
-               cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),
-               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"))
+                 "p < 0.05 → No estacionaria","p < 0.05 → Estac. con quiebre"), 3),
+  Serie=c(rep("Inf. mensual (M1)",4),rep("log(IPC) (M2)",4),rep("Δlog(IPC)",4)),
+  Stat=round(c(adf_inf$stat,pp_inf$stat,kpss_inf$stat,za_inf@teststat,
+               adf_log$stat,pp_log$stat,kpss_log$stat,za_log@teststat,
+               adf_dlog$stat,pp_dlog$stat,kpss_dlog$stat,za_dlog@teststat),4),
+  p=round(c(adf_inf$p.value,pp_inf$p.value,kpss_inf$p.value,p_za_inf,
+            adf_log$p.value,pp_log$p.value,kpss_log$p.value,p_za_log,
+            adf_dlog$p.value,pp_dlog$p.value,kpss_dlog$p.value,p_za_dlog),4),
+  Conclusion=c(cn(adf_inf$p.value,"adf"),cn(pp_inf$p.value,"adf"),cn(kpss_inf$p.value,"kpss"),cn(p_za_inf,"adf"),
+               cn(adf_log$p.value,"adf"),cn(pp_log$p.value,"adf"),cn(kpss_log$p.value,"kpss"),cn(p_za_log,"adf"),
+               cn(adf_dlog$p.value,"adf"),cn(pp_dlog$p.value,"adf"),cn(kpss_dlog$p.value,"kpss"),cn(p_za_dlog,"adf"))
 ) %>%
   kable(col.names=c("Prueba","H₀","Criterio de rechazo","Serie","Estadístico","p-valor","Conclusión"),
         caption="Pruebas de raíz unitaria — con hipótesis nulas",align=c("l","l","l","l","r","r","l")) %>%
   kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE, font_size=11) %>%
-  pack_rows("M1: Inflación mensual",1,3) %>% pack_rows("M2: log(IPC)",4,6) %>% pack_rows("Δlog(IPC)",7,9)
+  pack_rows("M1: Inflación mensual",1,4) %>% pack_rows("M2: log(IPC)",5,8) %>% pack_rows("Δlog(IPC)",9,12)
 ```
+
+> Zivot-Andrews (quiebre en intercepto): quiebre detectado en **`r format(brecha_inf,"%b %Y")`** (M1), **`r format(brecha_log,"%b %Y")`** (M2) y **`r format(brecha_dlog,"%b %Y")`** (Δlog(IPC)).
 
 ```{r acf-pacf, fig.height=5}
 par(mfrow=c(2,2),mar=c(4,4,3,1))
