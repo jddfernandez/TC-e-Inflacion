@@ -25,13 +25,13 @@ knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
   fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
 
 required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
-               "tseries","urca","lmtest","kableExtra","scales","gridExtra")
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra","plotly")
 new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
 if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
 
 library(readxl);library(dplyr);library(lubridate);library(ggplot2)
 library(forecast);library(tseries);library(urca);library(lmtest)
-library(kableExtra);library(scales);library(gridExtra)
+library(kableExtra);library(scales);library(gridExtra);library(plotly)
 
 tema <- theme_minimal(base_size=12) +
   theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
@@ -43,9 +43,30 @@ RUTA_BD <- "../Inputs/BD Bruta.xlsx"
 FECHA_INICIO <- as.Date("2023-11-01")
 FECHA_FIN    <- as.Date("2026-06-01")
 H_BACKTEST  <- 6
+H_BACKTEST_1Y <- 12
 H_FORECAST  <- 7
 MAX_P <- 4
 MAX_Q <- 4
+
+## ggplotly() ignora labs(subtitle=...) (solo convierte el titulo) y, sin
+## ajustar el ancho del widget, hereda el tamano en pixeles del dispositivo
+## grafico (fig.width*dpi), que puede exceder el area de contenido de la
+## pagina. gg_fluid() traslada el subtitulo al titulo (con salto de linea),
+## fuerza el widget a ocupar el 100% del contenedor en vez de un ancho fijo,
+## y reduce linewidth/size (calibrados para ggplot estatico, se ven muy
+## gruesos en el renderizado interactivo de plotly).
+gg_fluid <- function(p, line_scale=0.55, point_scale=0.5) {
+  st <- p$labels$subtitle
+  if (!is.null(st)) p <- p + labs(title=paste0(p$labels$title,"<br>",st), subtitle=NULL)
+  for (i in seq_along(p$layers)) {
+    ap <- p$layers[[i]]$aes_params
+    if (!is.null(ap$linewidth)) p$layers[[i]]$aes_params$linewidth <- ap$linewidth * line_scale
+    if (!is.null(ap$size))      p$layers[[i]]$aes_params$size      <- ap$size * point_scale
+  }
+  w <- ggplotly(p)
+  w$width <- "100%"
+  w
+}
 ```
 
 ```{r carga, include=FALSE}
@@ -188,7 +209,7 @@ estimar_grilla <- function(serie, xreg=NULL, max_p=MAX_P, max_q=MAX_Q) {
   res <- data.frame()
   for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) {
     if(p==0&&d==0&&q==0) next
-    fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML"), silent=TRUE)
+    fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML", include.drift=(d==1)), silent=TRUE)
     if(!inherits(fit,"try-error")) {
       acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
       k <- attr(logLik(fit),"df"); n <- fit$nobs
@@ -215,9 +236,9 @@ results_arimax <- estimar_grilla(log_TC_ts, xreg=xreg_ia)
 mejor_base   <- results_base[1,]
 mejor_arimax <- results_arimax[1,]
 
-modelo_base   <- Arima(log_TC_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML")
+modelo_base   <- Arima(log_TC_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML", include.drift=(mejor_base$d==1))
 modelo_arimax <- Arima(log_TC_ts, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
-                       xreg=xreg_ia, method="ML")
+                       xreg=xreg_ia, method="ML", include.drift=(mejor_arimax$d==1))
 
 orden_base   <- sprintf("ARIMA(%d,%d,%d)", mejor_base$p, mejor_base$d, mejor_base$q)
 orden_arimax <- sprintf("ARIMA(%d,%d,%d)+Inf_ia", mejor_arimax$p, mejor_arimax$d, mejor_arimax$q)
@@ -329,12 +350,12 @@ tc_obs      <- tail(tc_s$TC_digital, H_BACKTEST)
 xreg_tr <- xreg_ia[1:nt, , drop=FALSE]
 xreg_te <- xreg_ia[(nt+1):n, , drop=FALSE]
 
-bt_base   <- Arima(train_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML")
+bt_base   <- Arima(train_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML", include.drift=(mejor_base$d==1))
 fc_base   <- forecast(bt_base, h=H_BACKTEST, level=c(80,95))
 tc_base_bt <- exp(as.numeric(fc_base$mean))
 
 bt_arimax <- Arima(train_ts, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
-                   xreg=xreg_tr, method="ML")
+                   xreg=xreg_tr, method="ML", include.drift=(mejor_arimax$d==1))
 fc_arimax <- forecast(bt_arimax, h=H_BACKTEST, xreg=xreg_te, level=c(80,95))
 tc_arimax_bt <- exp(as.numeric(fc_arimax$mean))
 
@@ -369,17 +390,20 @@ data.frame(Metrica=c("RMSE (TC)","MAPE (%)"),
 ```
 
 ```{r grafico-bt, fig.height=5}
-hist_bt <- tc_s %>% filter(fecha < fechas_test[1]) %>% mutate(modelo="Historico") %>%
+## El ultimo punto historico se antepone a cada linea prospectiva para que el
+## grafico las muestre unidas visualmente con la serie historica.
+hist_bt  <- tc_s %>% filter(fecha < fechas_test[1]) %>% mutate(modelo="Histórico") %>%
   select(fecha,TC_digital,modelo) %>% rename(TC=TC_digital)
+punto_bt <- tail(hist_bt, 1)
 bt_df <- bind_rows(
   hist_bt,
-  data.frame(fecha=fechas_test, TC=tc_obs,       modelo="Observado"),
-  data.frame(fecha=fechas_test, TC=tc_base_bt,   modelo="ARIMA base"),
-  data.frame(fecha=fechas_test, TC=tc_arimax_bt, modelo="ARIMAX"))
+  data.frame(fecha=c(punto_bt$fecha,fechas_test), TC=c(punto_bt$TC,tc_obs),       modelo="Observado"),
+  data.frame(fecha=c(punto_bt$fecha,fechas_test), TC=c(punto_bt$TC,tc_base_bt),   modelo="ARIMA base"),
+  data.frame(fecha=c(punto_bt$fecha,fechas_test), TC=c(punto_bt$TC,tc_arimax_bt), modelo="ARIMAX"))
 
-ggplot(bt_df, aes(fecha,TC,color=modelo)) +
-  geom_line(linewidth=0.9) + geom_point(size=1.6) +
-  scale_color_manual(values=c(Historico="grey70", Observado="#2c3e50",
+p_bt <- ggplot(bt_df, aes(fecha,TC,color=modelo)) +
+  geom_line(linewidth=0.9) + geom_point(size=1.4) +
+  scale_color_manual(values=c(Histórico="grey70", Observado="#2c3e50",
                               `ARIMA base`="#2980b9", ARIMAX="#8e44ad")) +
   labs(title="Backtesting TC digital — ARIMA base vs. ARIMAX",
        subtitle=sprintf("RMSE: Base=%.4f (MAPE %.2f%%) | ARIMAX=%.4f (MAPE %.2f%%)",
@@ -387,9 +411,128 @@ ggplot(bt_df, aes(fecha,TC,color=modelo)) +
        x=NULL, y="TC digital (Bs/USD)", color=NULL) +
   scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_bt)
 ```
 
-> **Modelo elegido: `r etiqueta_final` (`r orden_final`).** RMSE fuera de muestra: Base = `r round(rmse_base,4)` vs ARIMAX = `r round(rmse_arimax,4)` (MAPE: `r round(mape_base,2)`% vs `r round(mape_arimax,2)`%). `r if (gana_arimax) "La inflación interanual mejora la capacidad predictiva fuera de muestra, así que el pronóstico final usa el ARIMAX." else "La inflación interanual no mejora el desempeño fuera de muestra frente al ARIMA base. Por eso el pronóstico final usa el ARIMA base, y el ARIMAX queda como escenario exploratorio / sensibilidad a la inflación."`
+> **Modelo elegido: `r etiqueta_final` (`r orden_final`).** RMSE fuera de muestra: Base = `r round(rmse_base,4)` vs ARIMAX = `r round(rmse_arimax,4)` (MAPE: `r round(mape_base,2)`% vs `r round(mape_arimax,2)`%). `r if (gana_arimax) "La inflación interanual mejora la capacidad predictiva fuera de muestra, así que el pronóstico final usa el ARIMAX." else "La inflación interanual no mejora el desempeño fuera de muestra frente al ARIMA base. Por eso el pronóstico final usa el ARIMA base, y el ARIMAX queda como escenario exploratorio / sensibilidad a la inflación."` Nota: como la elección aquí es independiente de `ARIMA_TC.Rmd` (que solo reporta el modelo base, nunca el ARIMAX), **el pronóstico final de este reporte puede diferir legítimamente del de `ARIMA_TC.Rmd`** siempre que el backtest favorezca al ARIMAX — no es un error, es el mismo criterio de selección aplicado de forma independiente en cada reporte.
+
+## Backtesting — Top 10 candidatos (Base y ARIMAX)
+
+Antes de fijar el ganador de cada familia, se muestra cómo habrían pronosticado las 10 mejores alternativas de cada grilla (no solo la ganadora), reestimadas sobre la misma ventana de entrenamiento. La ganadora se resalta en color; el resto, en gris.
+
+```{r bt-top10-setup, include=FALSE}
+backtest_top10_arimax_tc <- function(res, xreg_tr_=NULL, xreg_te_=NULL, ganador_nombre) {
+  n10 <- min(10, nrow(res))
+  vacia <- data.frame(fecha=as.Date(character()), TC=numeric(), modelo=character(), ganador=logical())
+  filas <- lapply(1:n10, function(i) {
+    r <- res[i,]
+    tryCatch({
+      fit <- if (is.null(xreg_tr_)) Arima(train_ts, order=c(r$p,r$d,r$q), method="ML", include.drift=(r$d==1))
+             else Arima(train_ts, order=c(r$p,r$d,r$q), xreg=xreg_tr_, method="ML", include.drift=(r$d==1))
+      fc  <- if (is.null(xreg_tr_)) suppressWarnings(forecast(fit, h=H_BACKTEST))
+             else suppressWarnings(forecast(fit, h=H_BACKTEST, xreg=xreg_te_))
+      data.frame(fecha=c(punto_bt$fecha, fechas_test),
+                 TC=c(punto_bt$TC, exp(as.numeric(fc$mean))),
+                 modelo=r$Modelo, ganador=r$Modelo==ganador_nombre)
+    }, error=function(e) NULL)
+  })
+  out <- bind_rows(filas)
+  if (nrow(out)==0) vacia else out
+}
+
+graficar_bt_top10_arimax_tc <- function(df_lineas, color_ganador, titulo) {
+  no_gan <- df_lineas %>% filter(!ganador)
+  si_gan <- df_lineas %>% filter(ganador)
+  vals <- setNames(c("#16a085","grey75",color_ganador), c("Histórico","Otros candidatos","Ganador"))
+
+  p <- ggplot() +
+    geom_line(data=hist_bt, aes(fecha,TC,color="Histórico"), linewidth=0.8)
+  if (nrow(no_gan) > 0) p <- p + geom_line(data=no_gan, aes(fecha,TC,group=modelo,color="Otros candidatos"), linewidth=0.5)
+  if (nrow(si_gan) > 0) p <- p + geom_line(data=si_gan, aes(fecha,TC,group=modelo,color="Ganador"), linewidth=1.3)
+  p <- p +
+    scale_color_manual(values=vals, breaks=names(vals)) +
+    labs(title=titulo, x=NULL, y="TC digital (Bs/USD)", color=NULL) +
+    scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
+    theme(axis.text.x=element_text(angle=45,hjust=1))
+  gg_fluid(p)
+}
+```
+
+```{r bt-top10-base, fig.height=4.5}
+graficar_bt_top10_arimax_tc(backtest_top10_arimax_tc(results_base, NULL, NULL, mejor_base$Modelo),
+                            "#2980b9", "ARIMA base — Backtesting Top 10 candidatos")
+```
+
+```{r bt-top10-arimax, fig.height=4.5}
+graficar_bt_top10_arimax_tc(backtest_top10_arimax_tc(results_arimax, xreg_tr, xreg_te, mejor_arimax$Modelo),
+                            "#8e44ad", "ARIMAX — Backtesting Top 10 candidatos")
+```
+
+## Backtesting a 1 año (`r H_BACKTEST_1Y` meses)
+
+Mismo ejercicio a un horizonte más largo, como evidencia adicional (no cambia el modelo elegido, que se decide con el backtest de `r H_BACKTEST` meses de arriba). Con solo `r length(log_TC_ts)` observaciones totales, un horizonte de `r H_BACKTEST_1Y` meses deja una ventana de entrenamiento muy corta — resultados aquí deben leerse como exploratorios.
+
+```{r backtesting-1y}
+nt_1y <- n - H_BACKTEST_1Y
+train_ts_1y    <- window(log_TC_ts, end=time(log_TC_ts)[nt_1y])
+fechas_test_1y <- tail(tc_s$fecha, H_BACKTEST_1Y)
+tc_obs_1y      <- tail(tc_s$TC_digital, H_BACKTEST_1Y)
+
+xreg_tr_1y <- xreg_ia[1:nt_1y, , drop=FALSE]
+xreg_te_1y <- xreg_ia[(nt_1y+1):n, , drop=FALSE]
+
+bt_base_1y   <- Arima(train_ts_1y, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML", include.drift=(mejor_base$d==1))
+tc_base_bt_1y <- exp(as.numeric(forecast(bt_base_1y, h=H_BACKTEST_1Y)$mean))
+
+bt_arimax_1y <- Arima(train_ts_1y, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
+                     xreg=xreg_tr_1y, method="ML", include.drift=(mejor_arimax$d==1))
+tc_arimax_bt_1y <- exp(as.numeric(forecast(bt_arimax_1y, h=H_BACKTEST_1Y, xreg=xreg_te_1y)$mean))
+
+rmse_base_1y   <- rmse_f(tc_obs_1y, tc_base_bt_1y);   mape_base_1y   <- mape_f(tc_obs_1y, tc_base_bt_1y)
+rmse_arimax_1y <- rmse_f(tc_obs_1y, tc_arimax_bt_1y); mape_arimax_1y <- mape_f(tc_obs_1y, tc_arimax_bt_1y)
+```
+
+```{r tabla-bt-1y}
+data.frame(Fecha=format(fechas_test_1y,"%b %Y"), TC_obs=round(tc_obs_1y,4),
+           Base=round(tc_base_bt_1y,4), ARIMAX=round(tc_arimax_bt_1y,4)) %>%
+  kable(col.names=c("Fecha","TC obs.","Base pron.","ARIMAX pron."),
+        caption=sprintf("Backtesting a %d meses — TC digital observado vs. pronosticado",H_BACKTEST_1Y),
+        align=c("l",rep("r",3))) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
+  scroll_box(height="320px")
+```
+
+```{r metricas-bt-1y}
+data.frame(Metrica=c("RMSE (TC)","MAPE (%)"),
+           Base=c(round(rmse_base_1y,4), paste0(round(mape_base_1y,2),"%")),
+           ARIMAX=c(round(rmse_arimax_1y,4), paste0(round(mape_arimax_1y,2),"%"))) %>%
+  kable(col.names=c("Métrica","ARIMA base","ARIMAX"),
+        caption=sprintf("Métricas de backtesting a %d meses",H_BACKTEST_1Y),align=c("l","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE)
+```
+
+```{r grafico-bt-1y, fig.height=5}
+hist_bt_1y  <- tc_s %>% filter(fecha < fechas_test_1y[1]) %>% mutate(modelo="Histórico") %>%
+  select(fecha,TC_digital,modelo) %>% rename(TC=TC_digital)
+punto_bt_1y <- tail(hist_bt_1y, 1)
+bt_df_1y <- bind_rows(
+  hist_bt_1y,
+  data.frame(fecha=c(punto_bt_1y$fecha,fechas_test_1y), TC=c(punto_bt_1y$TC,tc_obs_1y),       modelo="Observado"),
+  data.frame(fecha=c(punto_bt_1y$fecha,fechas_test_1y), TC=c(punto_bt_1y$TC,tc_base_bt_1y),   modelo="ARIMA base"),
+  data.frame(fecha=c(punto_bt_1y$fecha,fechas_test_1y), TC=c(punto_bt_1y$TC,tc_arimax_bt_1y), modelo="ARIMAX"))
+
+p_bt_1y <- ggplot(bt_df_1y, aes(fecha,TC,color=modelo)) +
+  geom_line(linewidth=0.9) + geom_point(size=1.4) +
+  scale_color_manual(values=c(Histórico="grey70", Observado="#2c3e50",
+                              `ARIMA base`="#2980b9", ARIMAX="#8e44ad")) +
+  labs(title=sprintf("Backtesting TC digital a %d meses — ARIMA base vs. ARIMAX",H_BACKTEST_1Y),
+       subtitle=sprintf("RMSE: Base=%.4f (MAPE %.2f%%) | ARIMAX=%.4f (MAPE %.2f%%)",
+                        rmse_base_1y, mape_base_1y, rmse_arimax_1y, mape_arimax_1y),
+       x=NULL, y="TC digital (Bs/USD)", color=NULL) +
+  scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_bt_1y)
+```
 
 ---
 
@@ -440,16 +583,22 @@ otro_linea  <- data.frame(fecha=c(pto_enlace$fecha, meses_pron),
                           TC=c(pto_enlace$TC_digital,   otro_proy))
 otro_nombre <- if (gana_arimax) "ARIMA base" else "ARIMAX"
 
-ggplot() +
+etq_elegido <- paste(etiqueta_final, "(elegido)")
+etq_otro    <- paste(otro_nombre, "(referencia)")
+p_fan <- ggplot() +
   geom_ribbon(data=ci_fan, aes(fecha, ymin=lo95, ymax=hi95), fill="#8e44ad", alpha=0.10) +
   geom_ribbon(data=ci_fan, aes(fecha, ymin=lo80, ymax=hi80), fill="#8e44ad", alpha=0.22) +
-  geom_line(data=tc_obs_df, aes(fecha, TC_digital), color="#2c3e50", linewidth=0.9) +
-  geom_line(data=final_linea, aes(fecha, TC), color="#8e44ad", linewidth=0.9) +
-  geom_line(data=otro_linea, aes(fecha, TC), color="#e74c3c", linewidth=0.9, linetype="dashed") +
+  geom_line(data=tc_obs_df, aes(fecha, TC_digital, color="Observado"), linewidth=0.9) +
+  geom_line(data=final_linea, aes(fecha, TC, color=etq_elegido), linewidth=0.9) +
+  geom_line(data=otro_linea, aes(fecha, TC, color=etq_otro), linewidth=0.9, linetype="dashed") +
+  scale_color_manual(values=setNames(c("#2c3e50","#8e44ad","#e74c3c"), c("Observado",etq_elegido,etq_otro)),
+                      breaks=c("Observado",etq_elegido,etq_otro)) +
   labs(title=sprintf("TC digital proyectado — %s (elegido) vs %s (referencia)", etiqueta_final, otro_nombre),
+       color=NULL,
        subtitle=sprintf("Elegido: %s", orden_final), x=NULL, y="TC digital (Bs/USD)") +
   scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_fan)
 ```
 
 ---

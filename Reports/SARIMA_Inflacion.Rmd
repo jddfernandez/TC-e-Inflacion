@@ -64,6 +64,43 @@ gg_fluid <- function(p, line_scale=0.55, point_scale=0.5) {
   w$width <- "100%"
   w
 }
+
+## Un shock puntual (dummy=1 en un solo mes) cae por definicion dentro de los
+## ultimos H meses reservados para cualquier backtest en cuanto ese mes esta
+## entre los mas recientes de la muestra (p.ej. Shock_Jun2026, el ultimo dato
+## disponible, SIEMPRE queda fuera de cualquier ventana de entrenamiento).
+## Esa columna resulta constante (=0) en el tramo de entrenamiento, lo que
+## singulariza la matriz de diseno. Se depuran las columnas sin varianza
+## ANTES de estimar -- raiz del problema, no un tryCatch que solo oculta el
+## sintoma. Se define aqui arriba (no solo en la seccion de Backtesting) para
+## que estimar_sarima() pueda usarla al backtestear cada candidato de la
+## grilla, no solo al ganador ya elegido.
+depurar_xreg <- function(xtr, xte) {
+  if (is.null(xtr)) return(list(tr=NULL, te=NULL))
+  keep <- apply(xtr, 2, function(col) length(unique(col)) > 1)
+  if (!any(keep)) return(list(tr=NULL, te=NULL))
+  list(tr=xtr[, keep, drop=FALSE], te=xte[, keep, drop=FALSE])
+}
+
+## ML puede fallar ("non-finite finite-difference value") en ventanas de
+## entrenamiento cortas con terminos estacionales, por malos valores
+## iniciales del optimizador. CSS-ML (arranca desde suma de cuadrados
+## condicional) suele resolverlo; CSS puro es el ultimo recurso. Se intenta
+## en cascada en vez de rendirse directo a NA.
+## Nunca pasar xreg=<variable que puede ser NULL> a Arima(): si esa variable
+## queda fuera de alcance para cuando forecast() intenta reevaluar la
+## llamada capturada (match.call), falla con "object '...' not found" --
+## solo para candidatos sin drift, silencioso y facil de pasar por alto (se
+## detecto al revisar el scoring de ARIMA_TC.Rmd esta sesion). Se omite el
+## argumento xreg por completo cuando no hay regresor.
+ajustar_arima_robusto <- function(serie, order, seasonal, xreg=NULL, drift=(order[2]+seasonal[2]==1)) {
+  for (m in c("ML","CSS-ML","CSS")) {
+    fit <- tryCatch(if (is.null(xreg)) Arima(serie, order=order, seasonal=seasonal, method=m, include.drift=drift)
+                    else Arima(serie, order=order, seasonal=seasonal, xreg=xreg, method=m, include.drift=drift), error=function(e) NULL)
+    if (!is.null(fit)) return(fit)
+  }
+  NULL
+}
 ```
 
 ```{r carga, include=FALSE}
@@ -233,43 +270,71 @@ par(mfrow=c(1,1))
 # Modelo A: SARIMA Puro
 
 ```{r sarima-estim, include=FALSE}
+## RMSE/MAPE del Score deben medir error FUERA de muestra (accuracy(fit) mide
+## error DENTRO de muestra, que premia sobreajuste). Ademas, mezclar backtest
+## y AICc/BIC/HQ en una sola suma dejaba que un candidato con buen backtest
+## pero AICc/BIC pesimos (sobreajuste posible en una serie corta) inflara su
+## posicion, o que un backtest de un solo candidato (n=H_BACKTEST, chico y
+## ruidoso) premiara un acierto de suerte. Por eso la seleccion va en dos
+## etapas: 1) Score = solo AICc/BIC/HQ/Complejidad/diagnosticos filtra el Top
+## 10 mejor soportado dentro de muestra; 2) entre esos 10, gana el menor RMSE
+## de backtest genuino (misma ventana n-H_BACKTEST reestimada con la cascada
+## ML/CSS-ML/CSS, igual criterio que ya usa este reporte mas abajo).
 estimar_sarima <- function(serie, d_val, D_val, max_p=3, max_q=3, max_P=1, max_Q=1,
-                           xreg_train=NULL, etiqueta="") {
+                           xreg_train=NULL, etiqueta="", h_bt=H_BACKTEST) {
   res <- data.frame()
   drift_opts <- if (d_val+D_val==1) c(TRUE,FALSE) else FALSE
+
+  n_s <- length(serie); nt_s <- n_s - h_bt
+  train_s <- window(serie, end=time(serie)[nt_s])
+  obs_s <- exp(as.numeric(tail(serie, h_bt)))
+  xd_s <- if (is.null(xreg_train)) list(tr=NULL, te=NULL) else
+    depurar_xreg(xreg_train[1:nt_s,,drop=FALSE], xreg_train[(nt_s+1):n_s,,drop=FALSE])
+
   for(p in 0:max_p) for(q in 0:max_q) for(P in 0:max_P) for(Q in 0:max_Q) for(drift in drift_opts) {
     if(p==0 && q==0 && P==0 && Q==0) next
     fit <- try(Arima(serie, order=c(p,d_val,q), seasonal=c(P,D_val,Q),
                      xreg=xreg_train, method="ML", include.drift=drift), silent=TRUE)
     if(!inherits(fit,"try-error")) {
-      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      ll <- as.numeric(logLik(fit))
       k <- attr(logLik(fit),"df"); n <- fit$nobs
       lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",
                               fitdf=length(coef(fit)))$p.value, error=function(e)NA)
       arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
       if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
       if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+
+      fit_bt_c <- ajustar_arima_robusto(train_s, c(p,d_val,q), c(P,D_val,Q), xd_s$tr, drift=drift)
+      if (is.null(fit_bt_c)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+        fc_bt <- tryCatch(suppressWarnings(if (is.null(xd_s$te)) forecast(fit_bt_c,h=h_bt) else forecast(fit_bt_c,h=h_bt,xreg=xd_s$te)),error=function(e)NULL)
+        if (is.null(fc_bt)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+          pred_bt <- exp(as.numeric(fc_bt$mean))
+          rmse_bt <- sqrt(mean((pred_bt-obs_s)^2)); mape_bt <- mean(abs((pred_bt-obs_s)/obs_s))*100
+        }
+      }
+
       nombre <- sprintf("(%d,%d,%d)(%d,%d,%d)[12]%s",p,d_val,q,P,D_val,Q,ifelse(drift,"+drift",""))
       res <- rbind(res, data.frame(
         Modelo=nombre, p=p,d=d_val,q=q,P=P,D_val=D_val,Q=Q,Drift=drift,
         AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
-        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        RMSE_bt=rmse_bt,MAPE_bt=mape_bt,
         LogLik=ll, LB=lb, Raices_ok=rok, Complexity=p+q+P+Q,
         stringsAsFactors=FALSE))
     }
   }
   if(nrow(res)==0) return(res)
-  res %>% mutate(
-    RMSE_s=as.numeric(scale(RMSE)), MAPE_s=as.numeric(scale(MAPE)),
+  peor_rmse <- max(res$RMSE_bt,na.rm=TRUE)*1.5; peor_mape <- max(res$MAPE_bt,na.rm=TRUE)*1.5
+  res %>% mutate(RMSE_bt=ifelse(is.na(RMSE_bt),peor_rmse,RMSE_bt), MAPE_bt=ifelse(is.na(MAPE_bt),peor_mape,MAPE_bt),
     AICc_s=as.numeric(scale(AICc)), BIC_s=as.numeric(scale(BIC)), HQ_s=as.numeric(scale(HQ)),
     Cx_s=as.numeric(scale(Complexity)),
     LB_p=ifelse(is.na(LB)|LB<0.05,1,0), R_p=ifelse(!Raices_ok,1,0),
-    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p
-  ) %>% arrange(Score)
+    Score=(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p
+  ) %>% arrange(Score) %>% mutate(Shortlist=row_number()<=min(10,n()))
 }
 
 res_A <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec)
-mejor_A <- res_A[1,]
+mejor_A <- res_A %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+fila_A  <- which(head(res_A,15)$Modelo == mejor_A$Modelo)
 
 ord_A <- c(mejor_A$p, mejor_A$d, mejor_A$q)
 sea_A <- c(mejor_A$P, mejor_A$D_val, mejor_A$Q)
@@ -281,12 +346,12 @@ Se estiman SARIMA$(p,d,q)(P,D,Q)_{12}$ sobre log(IPC) con $d=`r d_rec`$, $D=`r D
 ```{r tabla-A}
 res_A %>% head(15) %>%
   transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+            `RMSE(bt)`=round(RMSE_bt,5), `MAPE(bt)`=round(MAPE_bt,3), `LB(p)`=round(LB,4),
             Score=round(Score,3)) %>%
-  kable(caption=sprintf("Modelo A: SARIMA puro — Top 15 de %d modelos",nrow(res_A)),
+  kable(caption=sprintf("Modelo A: SARIMA puro — Top 15 de %d modelos (RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(res_A),H_BACKTEST),
         align=c("l",rep("r",6),"r")) %>%
   kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-  row_spec(1,bold=TRUE,color="white",background="#27ae60")
+  row_spec(fila_A,bold=TRUE,color="white",background="#27ae60")
 ```
 
 > **Ganador A:** `r mejor_A$Modelo` (Score = `r round(mejor_A$Score,3)`)
@@ -300,7 +365,8 @@ Se agregan dummies de **COVID** (mar–ago 2020), **Bloqueos** (may–jun 2025) 
 ```{r interv-estim, include=FALSE}
 res_B <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec,
                         xreg_train=xreg_dummies)
-mejor_B <- res_B[1,]
+mejor_B <- res_B %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+fila_B  <- which(head(res_B,15)$Modelo == mejor_B$Modelo)
 
 ord_B <- c(mejor_B$p, mejor_B$d, mejor_B$q)
 sea_B <- c(mejor_B$P, mejor_B$D_val, mejor_B$Q)
@@ -315,12 +381,12 @@ pv_B <- 2*(1-pnorm(abs(coefs_B/se_B)))
 ```{r tabla-B}
 res_B %>% head(15) %>%
   transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+            `RMSE(bt)`=round(RMSE_bt,5), `MAPE(bt)`=round(MAPE_bt,3), `LB(p)`=round(LB,4),
             Score=round(Score,3)) %>%
-  kable(caption=sprintf("Modelo B: SARIMA + Intervenciones — Top 15 de %d modelos",nrow(res_B)),
+  kable(caption=sprintf("Modelo B: SARIMA + Intervenciones — Top 15 de %d modelos (RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(res_B),H_BACKTEST),
         align=c("l",rep("r",6),"r")) %>%
   kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-  row_spec(1,bold=TRUE,color="white",background="#e67e22")
+  row_spec(fila_B,bold=TRUE,color="white",background="#e67e22")
 ```
 
 ```{r coefs-interv}
@@ -353,7 +419,8 @@ Se incorpora **TC digital** como variable exógena, junto a las dummies de inter
 ```{r sarimax-estim, include=FALSE}
 res_C <- estimar_sarima(log_ipc_ts, d_val=d_rec, D_val=D_rec,
                         xreg_train=xreg_full, max_p=2, max_q=2)
-mejor_C <- res_C[1,]
+mejor_C <- res_C %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+fila_C  <- which(head(res_C,15)$Modelo == mejor_C$Modelo)
 
 ord_C <- c(mejor_C$p, mejor_C$d, mejor_C$q)
 sea_C <- c(mejor_C$P, mejor_C$D_val, mejor_C$Q)
@@ -369,12 +436,12 @@ pv_C <- 2*(1-pnorm(abs(coefs_C/se_C)))
 if(nrow(res_C) > 0) {
   res_C %>% head(15) %>%
     transmute(Modelo, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-              RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB(p)`=round(LB,4),
+              `RMSE(bt)`=round(RMSE_bt,5), `MAPE(bt)`=round(MAPE_bt,3), `LB(p)`=round(LB,4),
               Score=round(Score,3)) %>%
-    kable(caption=sprintf("Modelo C: SARIMAX — Top 15 de %d modelos",nrow(res_C)),
+    kable(caption=sprintf("Modelo C: SARIMAX — Top 15 de %d modelos (RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(res_C),H_BACKTEST),
           align=c("l",rep("r",6),"r")) %>%
     kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-    row_spec(1,bold=TRUE,color="white",background="#8e44ad")
+    row_spec(fila_C,bold=TRUE,color="white",background="#8e44ad")
 }
 ```
 
@@ -410,23 +477,23 @@ if(length(idx_xr) > 0) {
 
 ```{r comparacion}
 comp <- data.frame(
-  Criterio=c("Modelo","Score","AICc","BIC","HQ","RMSE","MAPE","Ljung-Box (p)"),
+  Criterio=c("Modelo","Score","AICc","BIC","HQ","RMSE(bt)","MAPE(bt)","Ljung-Box (p)"),
   A_SARIMA=c(mejor_A$Modelo, round(mejor_A$Score,3), round(mejor_A$AICc,2),
-             round(mejor_A$BIC,2), round(mejor_A$HQ,2), round(mejor_A$RMSE,5),
-             round(mejor_A$MAPE,3), round(mejor_A$LB,4)),
+             round(mejor_A$BIC,2), round(mejor_A$HQ,2), round(mejor_A$RMSE_bt,5),
+             round(mejor_A$MAPE_bt,3), round(mejor_A$LB,4)),
   B_Interv=c(mejor_B$Modelo, round(mejor_B$Score,3), round(mejor_B$AICc,2),
-             round(mejor_B$BIC,2), round(mejor_B$HQ,2), round(mejor_B$RMSE,5),
-             round(mejor_B$MAPE,3), round(mejor_B$LB,4)),
+             round(mejor_B$BIC,2), round(mejor_B$HQ,2), round(mejor_B$RMSE_bt,5),
+             round(mejor_B$MAPE_bt,3), round(mejor_B$LB,4)),
   C_SARIMAX=c(mejor_C$Modelo, round(mejor_C$Score,3), round(mejor_C$AICc,2),
-              round(mejor_C$BIC,2), round(mejor_C$HQ,2), round(mejor_C$RMSE,5),
-              round(mejor_C$MAPE,3), round(mejor_C$LB,4))
+              round(mejor_C$BIC,2), round(mejor_C$HQ,2), round(mejor_C$RMSE_bt,5),
+              round(mejor_C$MAPE_bt,3), round(mejor_C$LB,4))
 )
 kable(comp, col.names=c("Criterio","A: SARIMA","B: + Intervenciones","C: + TC exógeno"),
-      caption="Comparación de los tres enfoques", align=c("l","r","r","r")) %>%
+      caption="Comparación de los tres enfoques (RMSE/MAPE = backtest genuino a H_BACKTEST meses)", align=c("l","r","r","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
 ```
 
-> El score compuesto es un criterio **dentro de muestra**. El criterio decisivo para elegir modelo base — desempeño **fuera de muestra** — se evalúa en la sección de Backtesting.
+> El **Score** (AICc/BIC/HQ/Complejidad/diagnósticos) filtra los 10 candidatos mejor soportados dentro de muestra dentro de cada enfoque; el ganador de cada enfoque (A/B/C) ya es, entre esos 10, el de menor backtest genuino. El criterio decisivo para elegir el modelo **base** entre A, B y C — desempeño fuera de muestra — se evalúa a continuación, en la sección de Backtesting.
 
 ```{r diagnostico-3, fig.height=6}
 par(mfrow=c(3,3), mar=c(3,3,3,1))
@@ -464,34 +531,9 @@ rmse_f <- function(obs,pred) sqrt(mean((pred-obs)^2, na.rm=TRUE))
 ## ajuste en tryCatch (mismo criterio que backtest_sarima() en SARIMA_M2.m)
 ## para que una falla de optim() en un modelo/horizonte no tumbe el reporte
 ## entero; el resto de los modelos/horizontes se reportan igual.
-## Un shock puntual (dummy=1 en un solo mes) cae por definicion dentro de los
-## ultimos H meses reservados para el backtest en cuanto ese mes esta entre
-## los mas recientes de la muestra (p.ej. Shock_Jun2026, el ultimo dato
-## disponible, SIEMPRE queda fuera de cualquier ventana de entrenamiento).
-## Esa columna resulta constante (=0) en el tramo de entrenamiento, lo que
-## singulariza la matriz de diseno y tumba el ajuste de B/C en todos los
-## horizontes. Se depuran las columnas sin varianza ANTES de estimar --raiz
-## del problema, no un tryCatch que solo oculta el sintoma.
-depurar_xreg <- function(xtr, xte) {
-  if (is.null(xtr)) return(list(tr=NULL, te=NULL))
-  keep <- apply(xtr, 2, function(col) length(unique(col)) > 1)
-  if (!any(keep)) return(list(tr=NULL, te=NULL))
-  list(tr=xtr[, keep, drop=FALSE], te=xte[, keep, drop=FALSE])
-}
-
-## ML puede fallar ("non-finite finite-difference value") en ventanas de
-## entrenamiento cortas con terminos estacionales, por malos valores
-## iniciales del optimizador. CSS-ML (arranca desde suma de cuadrados
-## condicional) suele resolverlo; CSS puro es el ultimo recurso. Se intenta
-## en cascada en vez de rendirse directo a NA.
-ajustar_arima_robusto <- function(serie, order, seasonal, xreg=NULL, drift=(order[2]+seasonal[2]==1)) {
-  for (m in c("ML","CSS-ML","CSS")) {
-    fit <- tryCatch(Arima(serie, order=order, seasonal=seasonal, xreg=xreg, method=m, include.drift=drift), error=function(e) NULL)
-    if (!is.null(fit)) return(fit)
-  }
-  NULL
-}
-
+## depurar_xreg() y ajustar_arima_robusto() ya se definieron en el chunk de
+## setup (las usa tambien estimar_sarima() para backtestear cada candidato
+## de la grilla, no solo al ganador ya elegido).
 fit_bt <- function(train_h, H, order, seasonal, xreg_tr=NULL, xreg_te=NULL, etiqueta="", drift=(order[2]+seasonal[2]==1)) {
   xd <- depurar_xreg(xreg_tr, xreg_te)
   tryCatch({

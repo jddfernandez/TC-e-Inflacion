@@ -188,51 +188,91 @@ par(mfrow=c(1,1))
 # Estimación y Selección
 
 ```{r estimacion, include=FALSE}
-estimar_grilla <- function(serie, max_p=MAX_P, max_q=MAX_Q) {
+## RMSE/MAPE del Score deben medir error FUERA de muestra. accuracy(fit) mide
+## error DENTRO de muestra (ajustado vs. observado en el propio entrenamiento),
+## que premia sobreajuste y ya esta correlacionado con AICc/BIC/HQ -- el Score
+## terminaba sin ninguna medida genuina de capacidad de pronostico, pudiendo
+## preferir un candidato que en el backtest real pronostica peor que otro con
+## mejor ajuste dentro de muestra. Se reestima cada candidato sobre la ventana
+## de entrenamiento (n-h_bt) y se mide el error contra los h_bt meses reales
+## reservados, igual que hace mas abajo el backtest del ganador.
+estimar_grilla <- function(serie, max_p=MAX_P, max_q=MAX_Q, h_bt=H_BACKTEST) {
+  n_g <- length(serie); nt_g <- n_g - h_bt
+  train_g <- window(serie, end=time(serie)[nt_g])
+  obs_g <- exp(as.numeric(tail(serie, h_bt)))
+
   res <- data.frame()
   for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) for(drift in if(d==1) c(TRUE,FALSE) else FALSE) {
     if(p==0&&d==0&&q==0) next
     fit <- try(Arima(serie,order=c(p,d,q),method="ML",include.drift=drift),silent=TRUE)
     if(!inherits(fit,"try-error")) {
-      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      ll <- as.numeric(logLik(fit))
       k <- attr(logLik(fit),"df"); n <- fit$nobs
       lb12 <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
       arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
       if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
       if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+
+      fit_bt <- try(Arima(train_g,order=c(p,d,q),method="ML",include.drift=drift),silent=TRUE)
+      if(inherits(fit_bt,"try-error")) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+        fc_bt <- tryCatch(suppressWarnings(forecast(fit_bt,h=h_bt)),error=function(e)NULL)
+        if(is.null(fc_bt)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+          pred_bt <- exp(as.numeric(fc_bt$mean))
+          rmse_bt <- sqrt(mean((pred_bt-obs_g)^2)); mape_bt <- mean(abs((pred_bt-obs_g)/obs_g))*100
+        }
+      }
+
       res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)%s",p,d,q,ifelse(drift,"+drift","")),p=p,d=d,q=q,Drift=drift,
         AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
-        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        RMSE_bt=rmse_bt,MAPE_bt=mape_bt,
         LogLik=ll,LB12=lb12,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
     }
   }
-  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
+  ## Candidatos cuyo backtest no converge en la ventana truncada reciben la
+  ## peor penalizacion en vez de NA (que scale() ignoraria sin castigo).
+  peor_rmse <- max(res$RMSE_bt,na.rm=TRUE)*1.5; peor_mape <- max(res$MAPE_bt,na.rm=TRUE)*1.5
+  res <- res %>% mutate(RMSE_bt=ifelse(is.na(RMSE_bt),peor_rmse,RMSE_bt), MAPE_bt=ifelse(is.na(MAPE_bt),peor_mape,MAPE_bt),
     AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
     Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB12)|LB12<0.05,1,0),
     R_p=ifelse(!Raices_ok,1,0),
-    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
+    ## Score = solo criterios DENTRO de muestra (ajuste/parsimonia). Filtra
+    ## primero los candidatos mal soportados por AICc/BIC/HQ (alto riesgo de
+    ## sobreajuste en una serie corta) -- recien DESPUES, entre ese shortlist
+    ## ya saneado, el backtest genuino (RMSE_bt) decide al ganador. Mezclar
+    ## ambas cosas en una sola suma dejaba que un candidato con RMSE_bt
+    ## excelente pero AICc/BIC pesimos (sobreajuste posible) inflara su
+    ## posicion; y dejar que el backtest de un solo candidato (n=h_bt=6,
+    ## muestra chica y ruidosa) decida solo, sin filtro, arriesga premiar
+    ## un acierto de suerte de un modelo sobreparametrizado.
+    Score=(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score) %>%
+    mutate(Shortlist=row_number()<=min(10,n()))
+  res
 }
 
 results_m2 <- estimar_grilla(log_TC_ts)
-mejor_m2 <- results_m2[1,]
+## Entre el shortlist (Top 10 por AICc/BIC/HQ), gana el de menor error de
+## backtest genuino -- mismo criterio "fuera de muestra decide" ya usado en
+## el proyecto para elegir entre familias de modelos.
+mejor_m2  <- results_m2 %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+fila_m2   <- which(head(results_m2,15)$Modelo == mejor_m2$Modelo)
 
 modelo_m2 <- Arima(log_TC_ts, order=c(mejor_m2$p, mejor_m2$d, mejor_m2$q), method="ML", include.drift=mejor_m2$Drift)
 orden_m2  <- mejor_m2$Modelo
 ```
 
-El scoring compuesto integra: **RMSE** + **MAPE** + promedio(**AICc**, **BIC**, **Hannan-Quinn**) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
+Selección en dos etapas: el **Score** (promedio de AICc, BIC y Hannan-Quinn + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas) filtra los 10 candidatos mejor soportados dentro de muestra; entre esos 10, gana el de menor **RMSE de backtest genuino** (`r H_BACKTEST` meses fuera de muestra) — resaltado en la tabla, no necesariamente la fila 1.
 
 ## Estimación ARIMA (log TC digital)
 
 ```{r tabla-m2}
 results_m2 %>% head(15) %>%
   transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            `RMSE(bt)`=round(RMSE_bt,4), `MAPE(bt)`=round(MAPE_bt,3), `LB12(p)`=round(LB12,4),
             Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
-  kable(caption=sprintf("M2 Logarítmico — Top 15 de %d modelos (variable: log TC digital)",nrow(results_m2)),
+  kable(caption=sprintf("M2 Logarítmico — Top 15 de %d modelos (variable: log TC digital; RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(results_m2),H_BACKTEST),
         align=c("l","c",rep("r",7),"c","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-  row_spec(1,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
+  row_spec(fila_m2,bold=TRUE,color="white",background="#2980b9") %>% column_spec(10,bold=TRUE)
 ```
 
 ## Diagnóstico del modelo (`r orden_m2`)
@@ -464,7 +504,7 @@ gg_fluid(p_fan)
 ---
 
 <center>
-*Scoring compuesto: RMSE + MAPE + (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces.*
+*Selección en dos etapas: Score = (AICc + BIC + HQ)/3 + 0.3·Complejidad + penalizaciones LB y raíces filtra el Top 10; entre esos, gana el menor RMSE de backtest fuera de muestra.*
 *Modelo: `r orden_m2` sobre log(TC).*
 *Muestra: `r format(FECHA_INICIO,"%b %Y")`–`r format(FECHA_FIN,"%b %Y")` (n=`r nrow(tc_s)`) — sin regresores exógenos; ver ARIMAX_TC.Rmd para el modelo con inflación interanual como predictor.*
 </center>

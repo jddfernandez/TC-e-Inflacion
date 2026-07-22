@@ -25,13 +25,13 @@ knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
   fig.width=10, fig.height=5.5, fig.align="center", comment="#>")
 
 required <- c("readxl","dplyr","lubridate","ggplot2","forecast",
-               "tseries","urca","lmtest","kableExtra","scales","gridExtra","zoo")
+               "tseries","urca","lmtest","kableExtra","scales","gridExtra","zoo","plotly")
 new_pkg  <- required[!(required %in% installed.packages()[,"Package"])]
 if (length(new_pkg)) install.packages(new_pkg, repos="https://cloud.r-project.org")
 
 library(readxl);library(dplyr);library(lubridate);library(ggplot2)
 library(forecast);library(tseries);library(urca);library(lmtest)
-library(kableExtra);library(scales);library(gridExtra);library(zoo)
+library(kableExtra);library(scales);library(gridExtra);library(zoo);library(plotly)
 
 tema <- theme_minimal(base_size=12) +
   theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
@@ -49,6 +49,26 @@ FECHA_INICIO <- as.Date("2023-11-01")
 FECHA_FIN    <- as.Date("2026-06-01")
 H_BACKTEST  <- 6
 H_FORECAST  <- 7
+
+## ggplotly() ignora labs(subtitle=...) (solo convierte el titulo) y, sin
+## ajustar el ancho del widget, hereda el tamano en pixeles del dispositivo
+## grafico (fig.width*dpi), que puede exceder el area de contenido de la
+## pagina. gg_fluid() traslada el subtitulo al titulo (con salto de linea),
+## fuerza el widget a ocupar el 100% del contenedor en vez de un ancho fijo,
+## y reduce linewidth/size (calibrados para ggplot estatico, se ven muy
+## gruesos en el renderizado interactivo de plotly).
+gg_fluid <- function(p, line_scale=0.55, point_scale=0.5) {
+  st <- p$labels$subtitle
+  if (!is.null(st)) p <- p + labs(title=paste0(p$labels$title,"<br>",st), subtitle=NULL)
+  for (i in seq_along(p$layers)) {
+    ap <- p$layers[[i]]$aes_params
+    if (!is.null(ap$linewidth)) p$layers[[i]]$aes_params$linewidth <- ap$linewidth * line_scale
+    if (!is.null(ap$size))      p$layers[[i]]$aes_params$size      <- ap$size * point_scale
+  }
+  w <- ggplotly(p)
+  w$width <- "100%"
+  w
+}
 ```
 
 ```{r carga, include=FALSE}
@@ -216,7 +236,7 @@ estimar_sarima <- function(serie, d_val, D_val, max_p=2, max_q=2, max_P=1, max_Q
     if(p==0 && q==0 && P==0 && Q==0) next
     out <- tryCatch({
       fit <- Arima(serie, order=c(p,d_val,q), seasonal=c(P,D_val,Q),
-                   xreg=xreg_train, method="ML")
+                   xreg=xreg_train, method="ML", include.drift=(d_val+D_val==1))
       acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
       k <- attr(logLik(fit),"df"); n <- fit$nobs
       lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",
@@ -249,7 +269,7 @@ mejor_A <- res_A[1,]
 
 ord_A <- c(mejor_A$p, mejor_A$d, mejor_A$q)
 sea_A <- c(mejor_A$P, mejor_A$D_val, mejor_A$Q)
-mod_A <- Arima(log_TC_ts, order=ord_A, seasonal=sea_A, method="ML")
+mod_A <- Arima(log_TC_ts, order=ord_A, seasonal=sea_A, method="ML", include.drift=(mejor_A$d+mejor_A$D_val==1))
 ```
 
 Se estiman SARIMA$(p,d,q)(P,D,Q)_{12}$ sobre log(TC digital) con $d=`r d_rec`$, $D=`r D_rec`$, $p,q \in [0,2]$, $P,Q \in [0,1]$.
@@ -279,7 +299,7 @@ mejor_B <- res_B[1,]
 
 ord_B <- c(mejor_B$p, mejor_B$d, mejor_B$q)
 sea_B <- c(mejor_B$P, mejor_B$D_val, mejor_B$Q)
-mod_B <- Arima(log_TC_ts, order=ord_B, seasonal=sea_B, xreg=xreg_dummies, method="ML")
+mod_B <- Arima(log_TC_ts, order=ord_B, seasonal=sea_B, xreg=xreg_dummies, method="ML", include.drift=(mejor_B$d+mejor_B$D_val==1))
 
 coefs_B <- coef(mod_B)
 se_B <- sqrt(diag(vcov(mod_B)))
@@ -330,7 +350,7 @@ mejor_C <- res_C[1,]
 
 ord_C <- c(mejor_C$p, mejor_C$d, mejor_C$q)
 sea_C <- c(mejor_C$P, mejor_C$D_val, mejor_C$Q)
-mod_C <- Arima(log_TC_ts, order=ord_C, seasonal=sea_C, xreg=xreg_full, method="ML")
+mod_C <- Arima(log_TC_ts, order=ord_C, seasonal=sea_C, xreg=xreg_full, method="ML", include.drift=(mejor_C$d+mejor_C$D_val==1))
 
 coefs_C <- coef(mod_C)
 se_C <- sqrt(diag(vcov(mod_C)))
@@ -428,11 +448,39 @@ n <- length(log_TC_ts); nt <- n - H_BACKTEST
 mape_f <- function(obs,pred) mean(abs((pred-obs)/obs), na.rm=TRUE)*100
 rmse_f <- function(obs,pred) sqrt(mean((pred-obs)^2, na.rm=TRUE))
 
+## Un shock puntual (dummy=1 en un solo mes) cae dentro de los ultimos H
+## meses reservados en cuanto ese mes esta entre los mas recientes de la
+## muestra (Shock_Jun2026, el ultimo dato disponible, SIEMPRE queda fuera de
+## la ventana de entrenamiento). Esa columna resulta constante (=0) en el
+## tramo de entrenamiento y singulariza la matriz de diseno, tumbando el
+## ajuste de B/C. Se depuran las columnas sin varianza ANTES de estimar.
+depurar_xreg <- function(xtr, xte) {
+  if (is.null(xtr)) return(list(tr=NULL, te=NULL))
+  keep <- apply(xtr, 2, function(col) length(unique(col)) > 1)
+  if (!any(keep)) return(list(tr=NULL, te=NULL))
+  list(tr=xtr[, keep, drop=FALSE], te=xte[, keep, drop=FALSE])
+}
+
+## ML puede fallar ("non-finite finite-difference value") en ventanas de
+## entrenamiento cortas con terminos estacionales, por malos valores
+## iniciales del optimizador. CSS-ML (arranca desde suma de cuadrados
+## condicional) suele resolverlo; CSS puro es el ultimo recurso. Se intenta
+## en cascada en vez de rendirse directo a NA.
+ajustar_arima_robusto <- function(serie, order, seasonal, xreg=NULL) {
+  drift <- (order[2] + seasonal[2] == 1)
+  for (m in c("ML","CSS-ML","CSS")) {
+    fit <- tryCatch(Arima(serie, order=order, seasonal=seasonal, xreg=xreg, method=m, include.drift=drift), error=function(e) NULL)
+    if (!is.null(fit)) return(fit)
+  }
+  NULL
+}
+
 fit_bt <- function(train_h, H, order, seasonal, xreg_tr=NULL, xreg_te=NULL, etiqueta="") {
+  xd <- depurar_xreg(xreg_tr, xreg_te)
   tryCatch({
-    fit <- if (is.null(xreg_tr)) Arima(train_h, order=order, seasonal=seasonal, method="ML")
-           else Arima(train_h, order=order, seasonal=seasonal, xreg=xreg_tr, method="ML")
-    fc  <- if (is.null(xreg_te)) forecast(fit, h=H) else forecast(fit, h=H, xreg=xreg_te)
+    fit <- ajustar_arima_robusto(train_h, order, seasonal, xd$tr)
+    if (is.null(fit)) stop("ningun metodo de estimacion convergio")
+    fc  <- if (is.null(xd$te)) forecast(fit, h=H) else forecast(fit, h=H, xreg=xd$te)
     exp(as.numeric(fc$mean))
   }, error = function(e) {
     warning(sprintf("Backtest %s no convergio: %s", etiqueta, conditionMessage(e)))
@@ -480,13 +528,14 @@ backtest_top10_df <- function(res, xreg_tr=NULL, xreg_te=NULL, ganador_nombre) {
   n10  <- min(10, nrow(res))
   punto <- data.frame(fecha=fechas_s[nt], TC=tc_s$TC_digital[nt])
   vacia <- data.frame(fecha=as.Date(character()), TC=numeric(), modelo=character(), ganador=logical())
+  xd <- depurar_xreg(xreg_tr, xreg_te)
   filas <- lapply(1:n10, function(i) {
     r <- res[i,]
     tryCatch({
-      fit <- if (is.null(xreg_tr)) Arima(train_ts, order=c(r$p,r$d,r$q), seasonal=c(r$P,r$D_val,r$Q), method="ML")
-             else Arima(train_ts, order=c(r$p,r$d,r$q), seasonal=c(r$P,r$D_val,r$Q), xreg=xreg_tr, method="ML")
-      fc <- if (is.null(xreg_tr)) suppressWarnings(forecast(fit, h=H_BACKTEST))
-            else suppressWarnings(forecast(fit, h=H_BACKTEST, xreg=xreg_te))
+      fit <- ajustar_arima_robusto(train_ts, c(r$p,r$d,r$q), c(r$P,r$D_val,r$Q), xd$tr)
+      if (is.null(fit)) stop("ningun metodo de estimacion convergio")
+      fc <- if (is.null(xd$tr)) suppressWarnings(forecast(fit, h=H_BACKTEST))
+            else suppressWarnings(forecast(fit, h=H_BACKTEST, xreg=xd$te))
       data.frame(fecha=c(punto$fecha, fechas_test),
                  TC=c(punto$TC, exp(as.numeric(fc$mean))),
                  modelo=r$Modelo, ganador=r$Modelo==ganador_nombre)
@@ -499,18 +548,27 @@ backtest_top10_df <- function(res, xreg_tr=NULL, xreg_te=NULL, ganador_nombre) {
 graficar_bt_top10 <- function(df_lineas, color_ganador, titulo) {
   hist_df <- tc_s %>% filter(fecha>=as.Date("2025-01-01"), fecha<=fechas_s[nt]) %>% select(fecha,TC_digital)
   obs_df  <- data.frame(fecha=c(fechas_s[nt],fechas_test), TC=c(tc_s$TC_digital[nt],tc_obs))
+  no_gan <- df_lineas %>% filter(!ganador)
+  si_gan <- df_lineas %>% filter(ganador)
 
-  ggplot() +
-    geom_line(data=hist_df, aes(fecha,TC_digital), color="#2c3e50", linewidth=0.8) +
-    geom_line(data=df_lineas %>% filter(!ganador), aes(fecha,TC,group=modelo),
-              color="grey75", linewidth=0.5) +
-    geom_line(data=df_lineas %>% filter(ganador), aes(fecha,TC,group=modelo),
-              color=color_ganador, linewidth=1.3) +
-    geom_line(data=obs_df, aes(fecha,TC), color="black", linewidth=0.9, linetype="22") +
-    geom_point(data=obs_df, aes(fecha,TC), color="black", size=1.6) +
-    labs(title=titulo, x=NULL, y="TC digital (Bs/USD)") +
+  ## ggplotly() lanza "argument 1 is not a vector" ante una capa geom_line con
+  ## data de 0 filas (p.ej. si el candidato ganador de la categoria no
+  ## converge en la ventana de entrenamiento truncada, algo esperable con
+  ## muestras tan cortas). Se agregan las capas solo si tienen datos.
+  vals <- setNames(c("#2c3e50","grey75",color_ganador,"black"),
+                    c("Histórico","Otros candidatos","Ganador","Observado"))
+  p <- ggplot() +
+    geom_line(data=hist_df, aes(fecha,TC_digital,color="Histórico"), linewidth=0.8)
+  if (nrow(no_gan) > 0) p <- p + geom_line(data=no_gan, aes(fecha,TC,group=modelo,color="Otros candidatos"), linewidth=0.5)
+  if (nrow(si_gan) > 0) p <- p + geom_line(data=si_gan, aes(fecha,TC,group=modelo,color="Ganador"), linewidth=1.3)
+  p <- p +
+    geom_line(data=obs_df, aes(fecha,TC,color="Observado"), linewidth=0.9, linetype="22") +
+    geom_point(data=obs_df, aes(fecha,TC,color="Observado"), size=1.6) +
+    scale_color_manual(values=vals, breaks=names(vals)) +
+    labs(title=titulo, x=NULL, y="TC digital (Bs/USD)", color=NULL) +
     scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
     theme(axis.text.x=element_text(angle=45,hjust=1))
+  gg_fluid(p) %>% layout(title=list(text=titulo))
 }
 ```
 
@@ -544,7 +602,7 @@ bt_all <- bind_rows(
 cols3 <- c(Historico="grey70", Observado="#2c3e50",
            `A: SARIMA`="#27ae60",`B: +Interv.`="#e67e22",`C: +Inflación`="#8e44ad")
 
-ggplot(bt_all, aes(fecha,TC,color=modelo)) +
+p_bt_all <- ggplot(bt_all, aes(fecha,TC,color=modelo)) +
   geom_line(linewidth=0.9) + geom_point(size=1.2) +
   scale_color_manual(values=cols3) +
   labs(title="Backtesting TC digital — Tres enfoques",
@@ -553,6 +611,7 @@ ggplot(bt_all, aes(fecha,TC,color=modelo)) +
        x=NULL,y="TC digital (Bs/USD)",color=NULL) +
   scale_x_date(date_breaks="4 months",date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_bt_all)
 ```
 
 ```{r veredicto-bt, include=FALSE}
@@ -610,7 +669,7 @@ tc_all <- bind_rows(
   data.frame(fecha=c(ult$fecha,meses_pron), TC_digital=c(ult$TC_digital,tc_pB), modelo="B: +Interv."),
   data.frame(fecha=c(ult$fecha,meses_pron), TC_digital=c(ult$TC_digital,tc_pC), modelo="C: +Inflación"))
 
-ggplot(tc_all, aes(fecha,TC_digital,color=modelo,linetype=modelo)) +
+p_tc_f <- ggplot(tc_all, aes(fecha,TC_digital,color=modelo,linetype=modelo)) +
   geom_line(linewidth=0.9) + geom_point(size=1) +
   scale_color_manual(values=c(Observado="black",`A: SARIMA`="#27ae60",
                                `B: +Interv.`="#e67e22",`C: +Inflación`="#8e44ad")) +
@@ -620,6 +679,7 @@ ggplot(tc_all, aes(fecha,TC_digital,color=modelo,linetype=modelo)) +
        x=NULL, y="TC digital (Bs/USD)", color=NULL, linetype=NULL) +
   scale_x_date(date_breaks="3 months",date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_tc_f)
 ```
 
 ## Fan chart — Modelo recomendado (`r mejor_ab`)
@@ -634,14 +694,16 @@ ci_fan <- data.frame(fecha=meses_pron, lo95=lo95_sel, hi95=hi95_sel)
 pto <- tail(tc_s %>% select(fecha,TC_digital), 1)
 linea_sel <- data.frame(fecha=c(pto$fecha,meses_pron), TC=c(pto$TC_digital, tc_sel))
 
-ggplot() +
+p_fan <- ggplot() +
   geom_ribbon(data=ci_fan, aes(fecha, ymin=lo95, ymax=hi95), fill="#27ae60", alpha=0.15) +
-  geom_line(data=tc_s, aes(fecha, TC_digital), color="#2c3e50", linewidth=0.9) +
-  geom_line(data=linea_sel, aes(fecha, TC), color="#27ae60", linewidth=1) +
+  geom_line(data=tc_s, aes(fecha, TC_digital, color="Observado"), linewidth=0.9) +
+  geom_line(data=linea_sel, aes(fecha, TC, color="Proyección"), linewidth=1) +
+  scale_color_manual(values=c(Observado="#2c3e50", `Proyección`="#27ae60")) +
   labs(title=sprintf("TC digital proyectado — Modelo recomendado: %s", mejor_ab),
-       x=NULL, y="TC digital (Bs/USD)") +
+       x=NULL, y="TC digital (Bs/USD)", color=NULL) +
   scale_x_date(date_breaks="3 months", date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
+gg_fluid(p_fan)
 ```
 
 ---

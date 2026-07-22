@@ -41,11 +41,12 @@ theme_set(tema)
 RUTA_BD    <- "../Inputs/BD Bruta.xlsx"
 H_BACKTEST <- 6
 H_FORECAST <- 6
+TC_SHOCK_MENSUAL <- 0.30  # Bs/USD por mes, escenario de estres sobre el TC digital
 mn <- c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto",
         "Septiembre","Octubre","Noviembre","Diciembre")
 ```
 
-> **Qué es este documento.** Un resumen comparativo de los modelos ya construidos y validados en sus propios reportes (`SARIMA_Inflacion.Rmd`, `ARIMA_Inflacion.Rmd`, `ARIMAX_Inflacion.Rmd`, `ARIMA_TC.Rmd`). No repite las grillas completas de AICc/BIC ni los diagnósticos residuales de cada uno — eso vive en el reporte de origen. Cada sección **re-estima su propia grilla de forma independiente** (no usa números pegados a mano), de modo que si los datos fuente cambian, este resumen refleja el cambio la próxima vez que se vuelva a knitear. `include.drift` se trata como una dimensión más de la grilla en los cuatro casos (evidencia, no regla mecánica) — ver `SARIMA_Inflacion.Rmd` para la discusión metodológica completa.
+>  Resumen comparativo de los modelos ya construidos y validados en sus propios reportes (`SARIMA_Inflacion.Rmd`, `ARIMA_Inflacion.Rmd`, `ARIMAX_Inflacion.Rmd`, `ARIMA_TC.Rmd`).
 
 ```{r carga, include=FALSE}
 meses_map <- c("Enero"=1,"Febrero"=2,"Marzo"=3,"Abril"=4,"Mayo"=5,
@@ -66,64 +67,13 @@ tc_mensual <- tc_raw %>%
   summarise(TC_digital=mean(`TC-DIGITAL`,na.rm=TRUE), dias=n(), .groups="drop") %>%
   mutate(fecha=as.Date(paste(anio,mes,"01",sep="-"))) %>% arrange(fecha)
 
-## Grilla no estacional (ARIMA/ARIMAX): drift como dimension de la grilla
-## (solo tiene sentido si d==1), identico criterio que ARIMA_Inflacion.Rmd /
-## ARIMAX_Inflacion.Rmd / ARIMA_TC.Rmd tras la revision de esta sesion.
-estimar_grilla <- function(serie, xreg=NULL, max_p=4, max_q=4) {
-  res <- data.frame()
-  for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) for(drift in if(d==1) c(TRUE,FALSE) else FALSE) {
-    if(p==0&&d==0&&q==0) next
-    fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML", include.drift=drift), silent=TRUE)
-    if(!inherits(fit,"try-error")) {
-      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
-      k <- attr(logLik(fit),"df"); n <- fit$nobs
-      lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
-      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
-      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
-      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
-      res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)%s",p,d,q,ifelse(drift,"+drift","")),p=p,d=d,q=q,Drift=drift,
-        AICc=fit$aicc,BIC=BIC(fit),HQ=-2*ll+2*k*log(log(n)),RMSE=acc[1,"RMSE"],MAPE=acc[1,"MAPE"],
-        LB=lb,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
-    }
-  }
-  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
-    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
-    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB)|LB<0.05,1,0),R_p=ifelse(!Raices_ok,1,0),
-    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
-}
-
-## Grilla estacional (SARIMA), identico criterio que SARIMA_Inflacion.Rmd.
-estimar_sarima <- function(serie, d_val, D_val, max_p=3, max_q=3, max_P=1, max_Q=1, xreg_train=NULL) {
-  res <- data.frame()
-  drift_opts <- if (d_val+D_val==1) c(TRUE,FALSE) else FALSE
-  for(p in 0:max_p) for(q in 0:max_q) for(P in 0:max_P) for(Q in 0:max_Q) for(drift in drift_opts) {
-    if(p==0 && q==0 && P==0 && Q==0) next
-    fit <- try(Arima(serie, order=c(p,d_val,q), seasonal=c(P,D_val,Q), xreg=xreg_train, method="ML", include.drift=drift), silent=TRUE)
-    if(!inherits(fit,"try-error")) {
-      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
-      k <- attr(logLik(fit),"df"); n <- fit$nobs
-      lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value, error=function(e)NA)
-      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
-      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
-      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
-      nombre <- sprintf("(%d,%d,%d)(%d,%d,%d)[12]%s",p,d_val,q,P,D_val,Q,ifelse(drift,"+drift",""))
-      res <- rbind(res, data.frame(Modelo=nombre,p=p,d=d_val,q=q,P=P,D_val=D_val,Q=Q,Drift=drift,
-        AICc=fit$aicc,BIC=BIC(fit),HQ=-2*ll+2*k*log(log(n)),RMSE=acc[1,"RMSE"],MAPE=acc[1,"MAPE"],
-        LB=lb,Raices_ok=rok,Complexity=p+q+P+Q,stringsAsFactors=FALSE))
-    }
-  }
-  if(nrow(res)==0) return(res)
-  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
-    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
-    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB)|LB<0.05,1,0),R_p=ifelse(!Raices_ok,1,0),
-    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
-}
-
 ## Un shock puntual (dummy=1 en un solo mes, p.ej. Shock_Jun2026 = el ultimo
 ## dato disponible) cae fuera de CUALQUIER ventana de entrenamiento de
 ## backtest, quedando constante (=0) ahi y singularizando la matriz de
 ## diseno. Se depuran las columnas sin varianza antes de estimar (mismo
-## criterio que SARIMA_Inflacion.Rmd).
+## criterio que SARIMA_Inflacion.Rmd). Se define antes de estimar_grilla()/
+## estimar_sarima() porque ambas la usan para backtestear cada candidato de
+## su propia grilla, no solo al ganador ya elegido.
 depurar_xreg <- function(xtr, xte) {
   if (is.null(xtr)) return(list(tr=NULL, te=NULL))
   keep <- apply(xtr, 2, function(col) length(unique(col)) > 1)
@@ -133,12 +83,120 @@ depurar_xreg <- function(xtr, xte) {
 
 ## Cascada ML -> CSS-ML -> CSS (mismo criterio que SARIMA_Inflacion.Rmd),
 ## necesaria solo para SARIMA en ventanas de entrenamiento mas cortas.
+## Nunca pasar xreg=<variable que puede ser NULL> a Arima(): si esa variable
+## queda fuera de alcance para cuando forecast() intenta reevaluar la
+## llamada capturada (match.call), falla con "object '...' not found" --
+## solo para candidatos sin drift, silencioso y facil de pasar por alto (ya
+## paso en esta sesion). Se omite el argumento xreg por completo cuando no
+## hay regresor.
 ajustar_arima_robusto <- function(serie, order, seasonal, xreg=NULL, drift=FALSE) {
   for (m in c("ML","CSS-ML","CSS")) {
-    fit <- tryCatch(Arima(serie, order=order, seasonal=seasonal, xreg=xreg, method=m, include.drift=drift), error=function(e) NULL)
+    fit <- tryCatch(if (is.null(xreg)) Arima(serie, order=order, seasonal=seasonal, method=m, include.drift=drift)
+                    else Arima(serie, order=order, seasonal=seasonal, xreg=xreg, method=m, include.drift=drift), error=function(e) NULL)
     if (!is.null(fit)) return(fit)
   }
   NULL
+}
+
+## Grilla no estacional (ARIMA/ARIMAX): drift como dimension de la grilla
+## (solo tiene sentido si d==1), identico criterio que ARIMA_Inflacion.Rmd /
+## ARIMAX_Inflacion.Rmd / ARIMA_TC.Rmd tras la revision de esta sesion.
+## RMSE/MAPE del Score deben medir error FUERA de muestra (accuracy(fit) mide
+## error DENTRO de muestra, que premia sobreajuste). La seleccion va en dos
+## etapas: 1) Score = solo AICc/BIC/HQ/Complejidad/diagnosticos filtra el Top
+## 10 mejor soportado dentro de muestra; 2) entre esos 10, gana el menor RMSE
+## de backtest genuino (reestimado sobre la ventana n-H_BACKTEST) -- mezclar
+## ambas cosas en una sola suma dejaba que un candidato con backtest excelente
+## pero AICc/BIC pesimos (sobreajuste en una serie corta) inflara su posicion,
+## o que el backtest de un solo candidato (chico y ruidoso) premiara un
+## acierto de suerte de un modelo sobreparametrizado.
+estimar_grilla <- function(serie, xreg=NULL, max_p=4, max_q=4, h_bt=H_BACKTEST) {
+  n_g <- length(serie); nt_g <- n_g - h_bt
+  train_g <- window(serie, end=time(serie)[nt_g])
+  obs_g <- exp(as.numeric(tail(serie, h_bt)))
+  xreg_tr_g <- if (is.null(xreg)) NULL else xreg[1:nt_g,,drop=FALSE]
+  xreg_te_g <- if (is.null(xreg)) NULL else xreg[(nt_g+1):n_g,,drop=FALSE]
+
+  res <- data.frame()
+  for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) for(drift in if(d==1) c(TRUE,FALSE) else FALSE) {
+    if(p==0&&d==0&&q==0) next
+    fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML", include.drift=drift), silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+
+      fit_bt <- try(if(is.null(xreg_tr_g)) Arima(train_g, order=c(p,d,q), method="ML", include.drift=drift)
+                    else Arima(train_g, order=c(p,d,q), xreg=xreg_tr_g, method="ML", include.drift=drift), silent=TRUE)
+      if(inherits(fit_bt,"try-error")) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+        fc_bt <- tryCatch(suppressWarnings(if(is.null(xreg_te_g)) forecast(fit_bt,h=h_bt) else forecast(fit_bt,h=h_bt,xreg=xreg_te_g)),error=function(e)NULL)
+        if(is.null(fc_bt)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+          pred_bt <- exp(as.numeric(fc_bt$mean))
+          rmse_bt <- sqrt(mean((pred_bt-obs_g)^2)); mape_bt <- mean(abs((pred_bt-obs_g)/obs_g))*100
+        }
+      }
+
+      res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)%s",p,d,q,ifelse(drift,"+drift","")),p=p,d=d,q=q,Drift=drift,
+        AICc=fit$aicc,BIC=BIC(fit),HQ=-2*ll+2*k*log(log(n)),RMSE_bt=rmse_bt,MAPE_bt=mape_bt,
+        LB=lb,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
+    }
+  }
+  peor_rmse <- max(res$RMSE_bt,na.rm=TRUE)*1.5; peor_mape <- max(res$MAPE_bt,na.rm=TRUE)*1.5
+  res %>% mutate(RMSE_bt=ifelse(is.na(RMSE_bt),peor_rmse,RMSE_bt), MAPE_bt=ifelse(is.na(MAPE_bt),peor_mape,MAPE_bt),
+    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB)|LB<0.05,1,0),R_p=ifelse(!Raices_ok,1,0),
+    Score=(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score) %>%
+    mutate(Shortlist=row_number()<=min(10,n()))
+}
+
+## Grilla estacional (SARIMA), identico criterio que SARIMA_Inflacion.Rmd
+## (mismas dos etapas de seleccion que estimar_grilla(), ver comentario arriba).
+estimar_sarima <- function(serie, d_val, D_val, max_p=3, max_q=3, max_P=1, max_Q=1, xreg_train=NULL, h_bt=H_BACKTEST) {
+  res <- data.frame()
+  drift_opts <- if (d_val+D_val==1) c(TRUE,FALSE) else FALSE
+
+  n_s <- length(serie); nt_s <- n_s - h_bt
+  train_s <- window(serie, end=time(serie)[nt_s])
+  obs_s <- exp(as.numeric(tail(serie, h_bt)))
+  xd_s <- if (is.null(xreg_train)) list(tr=NULL, te=NULL) else
+    depurar_xreg(xreg_train[1:nt_s,,drop=FALSE], xreg_train[(nt_s+1):n_s,,drop=FALSE])
+
+  for(p in 0:max_p) for(q in 0:max_q) for(P in 0:max_P) for(Q in 0:max_Q) for(drift in drift_opts) {
+    if(p==0 && q==0 && P==0 && Q==0) next
+    fit <- try(Arima(serie, order=c(p,d_val,q), seasonal=c(P,D_val,Q), xreg=xreg_train, method="ML", include.drift=drift), silent=TRUE)
+    if(!inherits(fit,"try-error")) {
+      ll <- as.numeric(logLik(fit))
+      k <- attr(logLik(fit),"df"); n <- fit$nobs
+      lb <- tryCatch(Box.test(residuals(fit),lag=min(12,n-k-1),type="Ljung-Box",fitdf=length(coef(fit)))$p.value, error=function(e)NA)
+      arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
+      if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
+      if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+
+      fit_bt_c <- ajustar_arima_robusto(train_s, c(p,d_val,q), c(P,D_val,Q), xd_s$tr, drift=drift)
+      if (is.null(fit_bt_c)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+        fc_bt <- tryCatch(suppressWarnings(if (is.null(xd_s$te)) forecast(fit_bt_c,h=h_bt) else forecast(fit_bt_c,h=h_bt,xreg=xd_s$te)),error=function(e)NULL)
+        if (is.null(fc_bt)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+          pred_bt <- exp(as.numeric(fc_bt$mean))
+          rmse_bt <- sqrt(mean((pred_bt-obs_s)^2)); mape_bt <- mean(abs((pred_bt-obs_s)/obs_s))*100
+        }
+      }
+
+      nombre <- sprintf("(%d,%d,%d)(%d,%d,%d)[12]%s",p,d_val,q,P,D_val,Q,ifelse(drift,"+drift",""))
+      res <- rbind(res, data.frame(Modelo=nombre,p=p,d=d_val,q=q,P=P,D_val=D_val,Q=Q,Drift=drift,
+        AICc=fit$aicc,BIC=BIC(fit),HQ=-2*ll+2*k*log(log(n)),RMSE_bt=rmse_bt,MAPE_bt=mape_bt,
+        LB=lb,Raices_ok=rok,Complexity=p+q+P+Q,stringsAsFactors=FALSE))
+    }
+  }
+  if(nrow(res)==0) return(res)
+  peor_rmse <- max(res$RMSE_bt,na.rm=TRUE)*1.5; peor_mape <- max(res$MAPE_bt,na.rm=TRUE)*1.5
+  res %>% mutate(RMSE_bt=ifelse(is.na(RMSE_bt),peor_rmse,RMSE_bt), MAPE_bt=ifelse(is.na(MAPE_bt),peor_mape,MAPE_bt),
+    AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
+    Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB)|LB<0.05,1,0),R_p=ifelse(!Raices_ok,1,0),
+    Score=(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score) %>%
+    mutate(Shortlist=row_number()<=min(10,n()))
 }
 
 der_ia <- function(ipv, meses_pron, ipc_hist, fechas_hist) {
@@ -176,29 +234,22 @@ d_rec <- ndiffs(log_ipc_2019, test="adf")
 D_rec <- nsdiffs(log_ipc_2019, test="ocsb")
 
 res_A <- estimar_sarima(log_ipc_2019, d_val=d_rec, D_val=D_rec)
-mejor_A <- res_A[1,]
+mejor_A <- res_A %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
 mod_A <- Arima(log_ipc_2019, order=c(mejor_A$p,mejor_A$d,mejor_A$q), seasonal=c(mejor_A$P,mejor_A$D_val,mejor_A$Q),
                method="ML", include.drift=mejor_A$Drift)
 
 res_B <- estimar_sarima(log_ipc_2019, d_val=d_rec, D_val=D_rec, xreg_train=xreg_dummies)
-mejor_B <- res_B[1,]
+mejor_B <- res_B %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
 mod_B <- Arima(log_ipc_2019, order=c(mejor_B$p,mejor_B$d,mejor_B$q), seasonal=c(mejor_B$P,mejor_B$D_val,mejor_B$Q),
                xreg=xreg_dummies, method="ML", include.drift=mejor_B$Drift)
 
-## Backtest H=6, sobre IPC en niveles (mismo criterio decisivo que el reporte de origen).
-n_s <- length(log_ipc_2019); nt_s <- n_s - H_BACKTEST
-train_s <- window(log_ipc_2019, end=time(log_ipc_2019)[nt_s])
-ipc_obs_s <- tail(ipc_2019$IPC, H_BACKTEST)
-xd_tr_s <- xreg_dummies[1:nt_s,,drop=FALSE]; xd_te_s <- xreg_dummies[(nt_s+1):n_s,,drop=FALSE]
-xd_s <- depurar_xreg(xd_tr_s, xd_te_s)
-
-fit_bt_A <- ajustar_arima_robusto(train_s, c(mejor_A$p,mejor_A$d,mejor_A$q), c(mejor_A$P,mejor_A$D_val,mejor_A$Q), drift=mejor_A$Drift)
-ipc_A_bt <- exp(as.numeric(forecast(fit_bt_A, h=H_BACKTEST)$mean))
-fit_bt_B <- ajustar_arima_robusto(train_s, c(mejor_B$p,mejor_B$d,mejor_B$q), c(mejor_B$P,mejor_B$D_val,mejor_B$Q), xd_s$tr, drift=mejor_B$Drift)
-ipc_B_bt <- exp(as.numeric(forecast(fit_bt_B, h=H_BACKTEST, xreg=xd_s$te)$mean))
-
-rmse_A <- sqrt(mean((ipc_A_bt-ipc_obs_s)^2)); mape_A <- mean(abs((ipc_A_bt-ipc_obs_s)/ipc_obs_s))*100
-rmse_B <- sqrt(mean((ipc_B_bt-ipc_obs_s)^2)); mape_B <- mean(abs((ipc_B_bt-ipc_obs_s)/ipc_obs_s))*100
+## RMSE/MAPE de backtest (H=6, IPC en niveles) ya vienen calculados por
+## estimar_sarima() -- fue necesario reestimar cada candidato de la grilla
+## sobre la ventana truncada para poder elegir con criterio de backtest
+## genuino (ver comentario en la definicion de estimar_sarima), asi que no
+## hace falta repetir el refit aqui solo para el ganador.
+rmse_A <- mejor_A$RMSE_bt; mape_A <- mejor_A$MAPE_bt
+rmse_B <- mejor_B$RMSE_bt; mape_B <- mejor_B$MAPE_bt
 
 sarima_gana_B <- rmse_B < rmse_A
 mod_sarima    <- if (sarima_gana_B) mod_B else mod_A
@@ -216,9 +267,38 @@ fc_sarima  <- if (sarima_gana_B) forecast(mod_B, h=H_FORECAST, xreg=xd_fut) else
 ipc_p_sarima <- exp(as.numeric(fc_sarima$mean))
 ia_sarima <- der_ia(ipc_p_sarima, meses_pron, ipc_hist, fechas_hist)
 im_sarima <- der_im(ipc_p_sarima, tail(ipc_hist,1))
+
+## Modelo C (SARIMA + dummies + TC exogeno), identico criterio que
+## SARIMA_Inflacion.Rmd (xreg_full = dummies + TC_dig). Nunca gana el
+## backtest frente a A/B (por eso no se reproduce como candidato "elegido"
+## en este resumen), pero es el unico integrante de la familia SARIMA con un
+## canal explicito para el TC -- se reproduce aqui solo para poder correr el
+## escenario de estres +TC_SHOCK_MENSUAL Bs/mes tambien sobre esta arquitectura,
+## no solo sobre ARIMAX.
+tc_merge_2019 <- ipc_2019 %>%
+  select(fecha) %>%
+  left_join(tc_mensual %>% select(fecha, TC_digital), by="fecha") %>%
+  mutate(
+    TC_digital = na.approx(TC_digital, na.rm=FALSE),
+    TC_digital = ifelse(is.na(TC_digital), na.locf(TC_digital, fromLast=TRUE, na.rm=FALSE), TC_digital),
+    TC_digital = ifelse(is.na(TC_digital), 6.96, TC_digital)
+  )
+xreg_full_2019 <- cbind(xreg_dummies, TC_dig=tc_merge_2019$TC_digital)
+
+res_C   <- estimar_sarima(log_ipc_2019, d_val=d_rec, D_val=D_rec, xreg_train=xreg_full_2019)
+mejor_C <- res_C %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+mod_C   <- Arima(log_ipc_2019, order=c(mejor_C$p,mejor_C$d,mejor_C$q), seasonal=c(mejor_C$P,mejor_C$D_val,mejor_C$Q),
+                 xreg=xreg_full_2019, method="ML", include.drift=mejor_C$Drift)
+
+xreg_tc_fut_C_shock <- matrix(tail(tc_merge_2019$TC_digital,1) + TC_SHOCK_MENSUAL*(1:H_FORECAST),
+                              ncol=1, dimnames=list(NULL,"TC_dig"))
+fc_C_shock    <- forecast(mod_C, h=H_FORECAST, xreg=cbind(xd_fut, xreg_tc_fut_C_shock))
+ipc_p_C_shock <- exp(as.numeric(fc_C_shock$mean))
+ia_C_shock    <- der_ia(ipc_p_C_shock, meses_pron, ipc_hist, fechas_hist)
+etq_C_shock   <- paste0("SARIMA ", mejor_C$Modelo, "+TC_dig (esc. +", TC_SHOCK_MENSUAL, " Bs/mes)")
 ```
 
-`d = r round(d_rec,0)`, `D = r round(D_rec,0)` (idénticos a `SARIMA_Inflacion.Rmd`). Se estiman **A: SARIMA puro** y **B: SARIMA + Intervenciones** (dummies COVID/Bloqueos/shocks); el modelo C (+ TC exógeno) no se reproduce aquí porque el reporte de origen nunca lo elige como modelo base — solo lo reporta como escenario exploratorio.
+`d = r round(d_rec,0)`, `D = r round(D_rec,0)` (idénticos a `SARIMA_Inflacion.Rmd`). Se estiman **A: SARIMA puro** y **B: SARIMA + Intervenciones** (dummies COVID/Bloqueos/shocks); ninguno de los dos elige TC como candidato ganador. El **modelo C (+ TC exógeno)** tampoco se reproduce aquí como candidato "elegido" (nunca gana el backtest frente a A/B en el reporte de origen), pero sí se reestima más abajo únicamente para poder correr el escenario de estrés del TC también sobre la familia SARIMA.
 
 ```{r sarima-tabla}
 data.frame(
@@ -239,14 +319,14 @@ ipc_2023 <- ipc %>% filter(year(fecha) >= ANIO_M2, !is.na(IPC))
 log_ipc_2023 <- ts(ipc_2023$log_IPC, start=c(year(min(ipc_2023$fecha)), month(min(ipc_2023$fecha))), frequency=12)
 
 res_m2 <- estimar_grilla(log_ipc_2023)
-mejor_m2 <- res_m2[1,]
+mejor_m2 <- res_m2 %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
 mod_m2 <- Arima(log_ipc_2023, order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q), method="ML", include.drift=mejor_m2$Drift)
 
+## nt_m2/n_m2 se reutilizan en el chunk arimax-compute (mismo corte de
+## backtest). RMSE/MAPE del ganador ya vienen de estimar_grilla() -- no hace
+## falta reestimarlo aqui (ver estimar_grilla()).
 n_m2 <- length(log_ipc_2023); nt_m2 <- n_m2 - H_BACKTEST
-ipc_obs_m2 <- tail(ipc_2023$IPC, H_BACKTEST)
-bt_m2 <- Arima(window(log_ipc_2023,end=time(log_ipc_2023)[nt_m2]), order=c(mejor_m2$p,mejor_m2$d,mejor_m2$q), method="ML", include.drift=mejor_m2$Drift)
-ipc_m2_bt <- exp(as.numeric(forecast(bt_m2, h=H_BACKTEST)$mean))
-rmse_m2 <- sqrt(mean((ipc_m2_bt-ipc_obs_m2)^2)); mape_m2 <- mean(abs((ipc_m2_bt-ipc_obs_m2)/ipc_obs_m2))*100
+rmse_m2 <- mejor_m2$RMSE_bt; mape_m2 <- mejor_m2$MAPE_bt
 
 ultimo_mes_m2 <- max(ipc_2023$fecha)
 meses_pron_m2 <- seq.Date(ultimo_mes_m2 %m+% months(1), by="month", length.out=H_FORECAST)
@@ -282,20 +362,16 @@ xreg_tc_2023 <- cbind(TC_dig = tc_merge_2023$TC_digital)
 
 res_base   <- estimar_grilla(log_ipc_2023)
 res_arimax <- estimar_grilla(log_ipc_2023, xreg=xreg_tc_2023)
-mejor_base   <- res_base[1,]
-mejor_arimax <- res_arimax[1,]
+mejor_base   <- res_base   %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+mejor_arimax <- res_arimax %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
 
 mod_base   <- Arima(log_ipc_2023, order=c(mejor_base$p,mejor_base$d,mejor_base$q), method="ML", include.drift=mejor_base$Drift)
 mod_arimax <- Arima(log_ipc_2023, order=c(mejor_arimax$p,mejor_arimax$d,mejor_arimax$q), xreg=xreg_tc_2023, method="ML", include.drift=mejor_arimax$Drift)
 
-xreg_tr_ax <- xreg_tc_2023[1:nt_m2,,drop=FALSE]; xreg_te_ax <- xreg_tc_2023[(nt_m2+1):n_m2,,drop=FALSE]
-bt_base   <- Arima(window(log_ipc_2023,end=time(log_ipc_2023)[nt_m2]), order=c(mejor_base$p,mejor_base$d,mejor_base$q), method="ML", include.drift=mejor_base$Drift)
-bt_arimax <- Arima(window(log_ipc_2023,end=time(log_ipc_2023)[nt_m2]), order=c(mejor_arimax$p,mejor_arimax$d,mejor_arimax$q), xreg=xreg_tr_ax, method="ML", include.drift=mejor_arimax$Drift)
-ipc_base_bt   <- exp(as.numeric(forecast(bt_base, h=H_BACKTEST)$mean))
-ipc_arimax_bt <- exp(as.numeric(forecast(bt_arimax, h=H_BACKTEST, xreg=xreg_te_ax)$mean))
-
-rmse_base   <- sqrt(mean((ipc_base_bt-ipc_obs_m2)^2));   mape_base   <- mean(abs((ipc_base_bt-ipc_obs_m2)/ipc_obs_m2))*100
-rmse_arimax <- sqrt(mean((ipc_arimax_bt-ipc_obs_m2)^2)); mape_arimax <- mean(abs((ipc_arimax_bt-ipc_obs_m2)/ipc_obs_m2))*100
+## RMSE/MAPE de cada ganador ya vienen de estimar_grilla() (ver comentario
+## en su definicion) -- no hace falta reestimar el backtest aqui.
+rmse_base   <- mejor_base$RMSE_bt;   mape_base   <- mejor_base$MAPE_bt
+rmse_arimax <- mejor_arimax$RMSE_bt; mape_arimax <- mejor_arimax$MAPE_bt
 
 arimax_gana <- rmse_arimax < rmse_base
 mod_final_ax  <- if (arimax_gana) mod_arimax else mod_base
@@ -308,6 +384,19 @@ fc_ax <- if (arimax_gana) forecast(mod_arimax, h=H_FORECAST, xreg=xreg_fut_ax) e
 ipc_p_ax <- exp(as.numeric(fc_ax$mean))
 ia_ax <- der_ia(ipc_p_ax, meses_pron_m2, ipc_hist, fechas_hist)
 im_ax <- der_im(ipc_p_ax, tail(ipc_hist,1))
+
+## Escenario de estres: el TC digital sube TC_SHOCK_MENSUAL (Bs/USD) cada mes
+## de forma acumulada, en vez de mantenerse plano (supuesto del pronostico
+## base de arriba). Es el unico de los tres modelos de inflacion con un canal
+## explicito para el TC, asi que se usa mod_arimax directamente (no
+## mod_final_ax): el escenario aisla el efecto del TC sobre la inflacion,
+## sin importar si ARIMAX gano el backtest frente al base.
+xreg_fut_ax_shock <- matrix(tail(tc_merge_2023$TC_digital,1) + TC_SHOCK_MENSUAL*(1:H_FORECAST),
+                            ncol=1, dimnames=list(NULL,"TC_dig"))
+fc_ax_shock    <- forecast(mod_arimax, h=H_FORECAST, xreg=xreg_fut_ax_shock)
+ipc_p_ax_shock <- exp(as.numeric(fc_ax_shock$mean))
+ia_ax_shock    <- der_ia(ipc_p_ax_shock, meses_pron_m2, ipc_hist, fechas_hist)
+etq_ax_shock   <- paste0(mejor_arimax$Modelo, "+TC_dig (esc. +", TC_SHOCK_MENSUAL, " Bs/mes)")
 ```
 
 ```{r arimax-tabla}
@@ -361,6 +450,56 @@ ggplot(comp_df, aes(fecha, yoy, color=modelo, linetype=modelo)) +
   theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
 
+## Escenario de Estrés — TC Digital +30 cts/mes
+
+> **Qué cambia en este escenario.** Los tres pronósticos de arriba asumen que el TC se mantiene plano en el nivel del último dato observado. Aquí se sustituye ese supuesto por una depreciación sostenida de Bs `r TC_SHOCK_MENSUAL` por mes (acumulando Bs `r round(TC_SHOCK_MENSUAL*H_FORECAST,2)` hacia el mes 6), y se corre de nuevo cada modelo que tiene un canal explícito para el TC. **ARIMAX** (`r mejor_arimax$Modelo`+TC_dig) es ese canal para la familia M2; para la familia SARIMA se reutiliza el **modelo C** (`r mejor_C$Modelo`+TC_dig) del reporte de origen — nunca elegido como ganador de esa familia porque no mejora el backtest frente a A/B, pero es el único con un coeficiente estimado sobre el TC. **SARIMA (A/B) y ARIMA M2 no tienen ningún regresor de TC**, así que sus líneas quedan exactamente iguales a su escenario base: no hay coeficiente que el shock pueda mover, e inyectárselo de todas formas sería fabricar un efecto que esos modelos nunca estimaron.
+
+```{r escenario-tabla}
+data.frame(
+  Mes = mn[month(meses_pron)][1:H_FORECAST],
+  SARIMA        = round(ia_sarima,2),
+  ARIMA_M2      = round(ia_m2,2),
+  ARIMAX_base   = round(ia_ax,2),
+  ARIMAX_TC30c  = round(ia_ax_shock,2),
+  SARIMA_TC30c  = round(ia_C_shock,2)
+) %>%
+  kable(col.names=c("Mes","SARIMA (base)","ARIMA M2 (base)","ARIMAX (base)",
+                     "ARIMAX +TC esc. (%interanual)","SARIMA+TC esc. (%interanual)"),
+        caption=sprintf("Inflación interanual bajo escenario TC +%s Bs/mes — %s | %s", TC_SHOCK_MENSUAL, etq_ax_shock, etq_C_shock),
+        align=c("l","r","r","r","r","r")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+```{r escenario-grafico, fig.height=5.5}
+esc_df <- bind_rows(
+  obs_reciente,
+  data.frame(fecha=c(ult_obs$fecha, meses_pron),    yoy=c(ult_obs$yoy, ia_sarima),   modelo="SARIMA (base)"),
+  data.frame(fecha=c(ult_obs$fecha, meses_pron_m2), yoy=c(ult_obs$yoy, ia_m2),       modelo="ARIMA M2 (base)"),
+  data.frame(fecha=c(ult_obs$fecha, meses_pron_m2), yoy=c(ult_obs$yoy, ia_ax),       modelo="ARIMAX (base)"),
+  data.frame(fecha=c(ult_obs$fecha, meses_pron_m2), yoy=c(ult_obs$yoy, ia_ax_shock), modelo="ARIMAX (TC +30cts/mes)"),
+  data.frame(fecha=c(ult_obs$fecha, meses_pron),    yoy=c(ult_obs$yoy, ia_C_shock),  modelo="SARIMA+TC (TC +30cts/mes)")
+)
+
+ggplot(esc_df, aes(fecha, yoy, color=modelo, linetype=modelo)) +
+  geom_line(linewidth=1) + geom_point(size=1.5) +
+  scale_color_manual(values=c(Observado="black", `SARIMA (base)`="#e67e22", `ARIMA M2 (base)`="#2980b9", `ARIMAX (base)`="#8e44ad",
+                              `ARIMAX (TC +30cts/mes)`="#c0392b", `SARIMA+TC (TC +30cts/mes)`="#d4a017")) +
+  scale_linetype_manual(values=c(Observado="solid", `SARIMA (base)`="solid", `ARIMA M2 (base)`="dashed", `ARIMAX (base)`="dotted",
+                                 `ARIMAX (TC +30cts/mes)`="twodash", `SARIMA+TC (TC +30cts/mes)`="twodash")) +
+  labs(title="Inflación interanual — escenario de estrés cambiario (TC +30 cts/mes)",
+       subtitle=sprintf("Bases sin cambios: SARIMA, ARIMA M2, ARIMAX | Escenario: ARIMAX y SARIMA+TC con TC +%s Bs/mes", TC_SHOCK_MENSUAL),
+       x=NULL, y="% interanual", color=NULL, linetype=NULL) +
+  scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+```{r escenario-hallazgo, include=FALSE}
+delta_ia_m6   <- tail(ia_ax_shock,1) - tail(ia_ax,1)
+delta_C_m6    <- tail(ia_C_shock,1)  - tail(ia_sarima,1)
+```
+
+> **Hallazgo del escenario.** Bajo la depreciación sostenida de Bs `r TC_SHOCK_MENSUAL`/mes, el canal ARIMAX proyecta una inflación interanual de `r round(tail(ia_ax_shock,1),2)`% al mes 6, frente a `r round(tail(ia_ax,1),2)`% en su propio escenario base — `r round(delta_ia_m6,2)` puntos porcentuales atribuibles enteramente a la depreciación asumida. El modelo C de la familia SARIMA (+TC) proyecta `r round(tail(ia_C_shock,1),2)`% al mes 6 bajo el mismo supuesto, `r round(delta_C_m6,2)` puntos por encima de la SARIMA elegida (`r etq_sarima`) — un pass-through cualitativamente similar estimado por una arquitectura independiente, lo que le da algo de robustez al efecto en vez de ser un artefacto de un solo modelo. La brecha entre las líneas base y las líneas de escenario es en sí misma una medida de cuánta incertidumbre cambiaria puede trasladarse a la inflación proyectada.
+
 ```{r recomendacion, include=FALSE}
 rmses <- c(SARIMA=rmse_sarima, ARIMA_M2=rmse_m2, ARIMAX=rmse_ax)
 ganador_final <- names(which.min(rmses))
@@ -383,14 +522,12 @@ tc_win <- tc_mensual %>%
 log_TC_ts <- ts(tc_win$log_TC, start=c(year(min(tc_win$fecha)), month(min(tc_win$fecha))), frequency=12)
 
 res_tc <- estimar_grilla(log_TC_ts)
-mejor_tc <- res_tc[1,]
+mejor_tc <- res_tc %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
 mod_tc <- Arima(log_TC_ts, order=c(mejor_tc$p,mejor_tc$d,mejor_tc$q), method="ML", include.drift=mejor_tc$Drift)
 
-n_tc <- length(log_TC_ts); nt_tc <- n_tc - H_BACKTEST
-tc_obs_bt <- tail(tc_win$TC_digital, H_BACKTEST)
-bt_tc <- Arima(window(log_TC_ts,end=time(log_TC_ts)[nt_tc]), order=c(mejor_tc$p,mejor_tc$d,mejor_tc$q), method="ML", include.drift=mejor_tc$Drift)
-tc_fc_bt <- exp(as.numeric(forecast(bt_tc, h=H_BACKTEST)$mean))
-rmse_tc <- sqrt(mean((tc_fc_bt-tc_obs_bt)^2)); mape_tc <- mean(abs((tc_fc_bt-tc_obs_bt)/tc_obs_bt))*100
+## RMSE/MAPE del ganador ya vienen de estimar_grilla() (ver comentario en su
+## definicion) -- no hace falta reestimar el backtest aqui.
+rmse_tc <- mejor_tc$RMSE_bt; mape_tc <- mejor_tc$MAPE_bt
 
 ultimo_tc <- tail(tc_win$TC_digital,1)
 meses_pron_tc <- seq.Date(max(tc_win$fecha) %m+% months(1), by="month", length.out=H_FORECAST)
@@ -418,17 +555,25 @@ data.frame(Mes=mn[month(meses_pron_tc)][1:H_FORECAST], TC=round(tc_p,4), Var_men
 ```{r tc-grafico, fig.height=5}
 tc_hist_reciente <- tc_win %>% filter(fecha >= (max(fecha) %m-% months(12))) %>% transmute(fecha, tc=TC_digital, tipo="Histórico")
 tc_proy_df <- data.frame(fecha=c(tail(tc_hist_reciente$fecha,1), meses_pron_tc), tc=c(tail(tc_hist_reciente$tc,1), tc_p), tipo="Proyección")
+## Misma trayectoria supuesta que alimenta el escenario ARIMAX de la seccion
+## de inflacion (xreg_fut_ax_shock), solo que graficada aqui en Bs/USD para
+## que se vea el supuesto en si mismo, no su efecto sobre la inflacion.
+tc_shock_df <- data.frame(fecha=c(tail(tc_hist_reciente$fecha,1), meses_pron_tc),
+                           tc=c(tail(tc_hist_reciente$tc,1), ultimo_tc + TC_SHOCK_MENSUAL*(1:H_FORECAST)),
+                           tipo="Escenario +30cts/mes")
 
-ggplot(bind_rows(tc_hist_reciente, tc_proy_df), aes(fecha, tc, color=tipo, linetype=tipo)) +
+ggplot(bind_rows(tc_hist_reciente, tc_proy_df, tc_shock_df), aes(fecha, tc, color=tipo, linetype=tipo)) +
   geom_line(linewidth=1) + geom_point(size=1.5) +
-  scale_color_manual(values=c(Histórico="#16a085", Proyección="#16a085")) +
-  scale_linetype_manual(values=c(Histórico="solid", Proyección="dashed")) +
+  scale_color_manual(values=c(Histórico="#16a085", Proyección="#16a085", `Escenario +30cts/mes`="#c0392b")) +
+  scale_linetype_manual(values=c(Histórico="solid", Proyección="dashed", `Escenario +30cts/mes`="twodash")) +
   labs(title="Tipo de cambio digital — proyección a 6 meses",
-       subtitle=sprintf("Modelo: %s | RMSE=%.4f | MAPE=%.2f%%", mejor_tc$Modelo, rmse_tc, mape_tc),
+       subtitle=sprintf("Modelo: %s | RMSE=%.4f | MAPE=%.2f%% | escenario de estrés: +%s Bs/mes", mejor_tc$Modelo, rmse_tc, mape_tc, TC_SHOCK_MENSUAL),
        x=NULL, y="Bs/USD", color=NULL, linetype=NULL) +
   scale_x_date(date_breaks="2 months", date_labels="%b %Y") +
   theme(axis.text.x=element_text(angle=45,hjust=1))
 ```
+
+> El escenario +30cts/mes es un supuesto exógeno de estrés, no una proyección del modelo ARIMA de TC: sirve como input al canal ARIMAX de la sección de inflación (arriba) para cuantificar cuánta inflación adicional se trasladaría si el TC se depreciara más rápido de lo que el modelo de TC por sí solo anticipa.
 
 > No hay comparación entre modelos de TC en este resumen porque solo `ARIMA_TC.Rmd` se incluye aquí (por decisión explícita, se excluyen `ARIMAX_TC.Rmd` y `SARIMA_TC.Rmd`).
 

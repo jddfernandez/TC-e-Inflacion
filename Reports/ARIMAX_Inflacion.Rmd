@@ -220,36 +220,75 @@ par(mfrow=c(1,1))
 # Estimación y Selección — ARIMA base vs. ARIMAX
 
 ```{r estimacion, include=FALSE}
-estimar_grilla <- function(serie, xreg=NULL, max_p=MAX_P, max_q=MAX_Q) {
+## RMSE/MAPE del Score deben medir error FUERA de muestra (accuracy(fit) mide
+## error DENTRO de muestra, que premia sobreajuste). Ademas, mezclar backtest
+## y AICc/BIC/HQ en una sola suma dejaba que un candidato con buen backtest
+## pero AICc/BIC pesimos (sobreajuste posible en una serie corta) inflara su
+## posicion, o que un backtest de un solo candidato (n=h_bt, chico y ruidoso)
+## premiara un acierto de suerte. Por eso la seleccion va en dos etapas: 1)
+## Score = solo AICc/BIC/HQ/Complejidad/diagnosticos filtra el Top 10 mejor
+## soportado dentro de muestra; 2) entre esos 10, gana el menor RMSE de
+## backtest genuino (misma ventana n-h_bt reestimada, igual criterio que ya
+## usa este reporte para decidir entre ARIMA base y ARIMAX).
+estimar_grilla <- function(serie, xreg=NULL, max_p=MAX_P, max_q=MAX_Q, h_bt=H_BACKTEST) {
+  n_g <- length(serie); nt_g <- n_g - h_bt
+  train_g <- window(serie, end=time(serie)[nt_g])
+  obs_g <- exp(as.numeric(tail(serie, h_bt)))
+  xreg_tr_g <- if (is.null(xreg)) NULL else xreg[1:nt_g,,drop=FALSE]
+  xreg_te_g <- if (is.null(xreg)) NULL else xreg[(nt_g+1):n_g,,drop=FALSE]
+
   res <- data.frame()
   for(p in 0:max_p) for(q in 0:max_q) for(d in 0:1) for(drift in if(d==1) c(TRUE,FALSE) else FALSE) {
     if(p==0&&d==0&&q==0) next
     fit <- try(Arima(serie, order=c(p,d,q), xreg=xreg, method="ML", include.drift=drift), silent=TRUE)
     if(!inherits(fit,"try-error")) {
-      acc <- accuracy(fit); ll <- as.numeric(logLik(fit))
+      ll <- as.numeric(logLik(fit))
       k <- attr(logLik(fit),"df"); n <- fit$nobs
       lb12 <- tryCatch(Box.test(residuals(fit),lag=12,type="Ljung-Box",fitdf=length(coef(fit)))$p.value,error=function(e)NA)
       arc <- fit$model$phi; mac <- fit$model$theta; rok <- TRUE
       if(length(arc)>0&&any(arc!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,-arc)))<1)
       if(length(mac)>0&&any(mac!=0)) rok <- rok&&all(Mod(1/polyroot(c(1,mac)))<1)
+
+      ## Nunca pasar xreg=<variable local que puede ser NULL> a Arima(): si
+      ## esa variable queda fuera de alcance para cuando forecast() intenta
+      ## reevaluar la llamada capturada (match.call), falla con "object
+      ## '...' not found" -- pero solo para candidatos sin drift, silencioso
+      ## y facil de pasar por alto (ya paso en esta sesion). Se omite el
+      ## argumento xreg por completo cuando no hay regresor, igual que ya
+      ## hace backtest_top10_arimax() mas abajo.
+      fit_bt <- try(if(is.null(xreg_tr_g)) Arima(train_g, order=c(p,d,q), method="ML", include.drift=drift)
+                    else Arima(train_g, order=c(p,d,q), xreg=xreg_tr_g, method="ML", include.drift=drift), silent=TRUE)
+      if(inherits(fit_bt,"try-error")) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+        fc_bt <- tryCatch(suppressWarnings(if(is.null(xreg_te_g)) forecast(fit_bt,h=h_bt) else forecast(fit_bt,h=h_bt,xreg=xreg_te_g)),error=function(e)NULL)
+        if(is.null(fc_bt)) { rmse_bt<-NA_real_; mape_bt<-NA_real_ } else {
+          pred_bt <- exp(as.numeric(fc_bt$mean))
+          rmse_bt <- sqrt(mean((pred_bt-obs_g)^2)); mape_bt <- mean(abs((pred_bt-obs_g)/obs_g))*100
+        }
+      }
+
       res <- rbind(res,data.frame(Modelo=sprintf("ARIMA(%d,%d,%d)%s",p,d,q,ifelse(drift,"+drift","")),p=p,d=d,q=q,Drift=drift,
         AIC=AIC(fit),BIC=BIC(fit),AICc=fit$aicc,HQ=-2*ll+2*k*log(log(n)),
-        RMSE=acc[1,"RMSE"],MAE=acc[1,"MAE"],MAPE=acc[1,"MAPE"],
+        RMSE_bt=rmse_bt,MAPE_bt=mape_bt,
         LogLik=ll,LB12=lb12,Raices_ok=rok,Complexity=p+q,stringsAsFactors=FALSE))
     }
   }
-  res %>% mutate(RMSE_s=as.numeric(scale(RMSE)),MAPE_s=as.numeric(scale(MAPE)),
+  peor_rmse <- max(res$RMSE_bt,na.rm=TRUE)*1.5; peor_mape <- max(res$MAPE_bt,na.rm=TRUE)*1.5
+  res <- res %>% mutate(RMSE_bt=ifelse(is.na(RMSE_bt),peor_rmse,RMSE_bt), MAPE_bt=ifelse(is.na(MAPE_bt),peor_mape,MAPE_bt),
     AICc_s=as.numeric(scale(AICc)),BIC_s=as.numeric(scale(BIC)),HQ_s=as.numeric(scale(HQ)),
     Cx_s=as.numeric(scale(Complexity)),LB_p=ifelse(is.na(LB12)|LB12<0.05,1,0),
     R_p=ifelse(!Raices_ok,1,0),
-    Score=RMSE_s+MAPE_s+(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score)
+    Score=(AICc_s+BIC_s+HQ_s)/3+0.3*Cx_s+2*LB_p+2*R_p) %>% arrange(Score) %>%
+    mutate(Shortlist=row_number()<=min(10,n()))
+  res
 }
 
 results_base   <- estimar_grilla(log_ipc_ts)
 results_arimax <- estimar_grilla(log_ipc_ts, xreg=xreg_tc)
 
-mejor_base   <- results_base[1,]
-mejor_arimax <- results_arimax[1,]
+mejor_base   <- results_base   %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+mejor_arimax <- results_arimax %>% filter(Shortlist) %>% arrange(RMSE_bt) %>% slice(1)
+fila_base    <- which(head(results_base,15)$Modelo == mejor_base$Modelo)
+fila_arimax  <- which(head(results_arimax,15)$Modelo == mejor_arimax$Modelo)
 
 modelo_base   <- Arima(log_ipc_ts, order=c(mejor_base$p, mejor_base$d, mejor_base$q), method="ML", include.drift=mejor_base$Drift)
 modelo_arimax <- Arima(log_ipc_ts, order=c(mejor_arimax$p, mejor_arimax$d, mejor_arimax$q),
@@ -264,19 +303,19 @@ idx_tc  <- which(names(coefs_arimax) == "TC_dig")
 tc_sig  <- length(idx_tc) > 0 && !is.na(pv_arimax[idx_tc]) && pv_arimax[idx_tc] < 0.05
 ```
 
-Ambas grillas recorren $p,q \in [0,`r MAX_P`]$, $d \in \{0,1\}$ sobre **log(IPC)**; la única diferencia es la presencia del regresor `TC_dig` (TC digital). Mismo scoring compuesto que el resto del proyecto: RMSE + MAPE + promedio(AICc, BIC, HQ) + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas.
+Ambas grillas recorren $p,q \in [0,`r MAX_P`]$, $d \in \{0,1\}$ sobre **log(IPC)**; la única diferencia es la presencia del regresor `TC_dig` (TC digital). Selección en dos etapas: el **Score** (promedio de AICc, BIC, Hannan-Quinn + 0.3 × Complejidad + penalizaciones por Ljung-Box y raíces inversas) filtra los 10 candidatos mejor soportados dentro de muestra; entre esos 10, gana el de menor **RMSE de backtest genuino** (`r H_BACKTEST` meses fuera de muestra).
 
 ## ARIMA base (sin exógena)
 
 ```{r tabla-base}
 results_base %>% head(15) %>%
   transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            `RMSE(bt)`=round(RMSE_bt,4), `MAPE(bt)`=round(MAPE_bt,3), `LB12(p)`=round(LB12,4),
             Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
-  kable(caption=sprintf("ARIMA base — Top 15 de %d modelos (log IPC, sin regresor)",nrow(results_base)),
+  kable(caption=sprintf("ARIMA base — Top 15 de %d modelos (log IPC, sin regresor; RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(results_base),H_BACKTEST),
         align=c("l","c",rep("r",7),"c","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-  row_spec(1,bold=TRUE,color="white",background="#2980b9")
+  row_spec(fila_base,bold=TRUE,color="white",background="#2980b9")
 ```
 
 > **Ganador:** `r orden_base` (Score = `r round(mejor_base$Score,3)`)
@@ -286,12 +325,12 @@ results_base %>% head(15) %>%
 ```{r tabla-arimax}
 results_arimax %>% head(15) %>%
   transmute(Modelo, d, AICc=round(AICc,2), BIC=round(BIC,2), HQ=round(HQ,2),
-            RMSE=round(RMSE,5), MAPE=round(MAPE,3), `LB12(p)`=round(LB12,4),
+            `RMSE(bt)`=round(RMSE_bt,4), `MAPE(bt)`=round(MAPE_bt,3), `LB12(p)`=round(LB12,4),
             Raices=ifelse(Raices_ok,"OK","No"), Score=round(Score,3)) %>%
-  kable(caption=sprintf("ARIMAX — Top 15 de %d modelos (log IPC + TC digital)",nrow(results_arimax)),
+  kable(caption=sprintf("ARIMAX — Top 15 de %d modelos (log IPC + TC digital; RMSE/MAPE = backtest a %d meses; resaltado = ganador)",nrow(results_arimax),H_BACKTEST),
         align=c("l","c",rep("r",7),"c","r")) %>%
   kable_styling(bootstrap_options=c("striped","hover","condensed"),full_width=FALSE,font_size=11) %>%
-  row_spec(1,bold=TRUE,color="white",background="#8e44ad")
+  row_spec(fila_arimax,bold=TRUE,color="white",background="#8e44ad")
 ```
 
 > **Ganador:** `r orden_arimax` (Score = `r round(mejor_arimax$Score,3)`)
